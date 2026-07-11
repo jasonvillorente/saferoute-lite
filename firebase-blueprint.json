@@ -1,0 +1,95 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "Represents a resident or admin in the SafeRoute system.",
+      "type": "object",
+      "properties": {
+        "name": { "type": "string", "description": "Full name of the user" },
+        "email": { "type": "string", "description": "Email address" },
+        "role": { "type": "string", "enum": ["resident", "admin"], "description": "System role" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Server timestamp of registration" }
+      },
+      "required": ["name", "email", "role", "createdAt"]
+    },
+    "Report": {
+      "title": "Report",
+      "description": "A safety report submitted by a resident.",
+      "type": "object",
+      "properties": {
+        "reporterId": { "type": "string", "description": "UID of the resident who submitted the report" },
+        "location": { "type": "object", "description": "Geopoint: { lat, lng }" },
+        "description": { "type": "string", "description": "Details of the unsafe situation" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"], "description": "Verification status" },
+        "imageUrl": { "type": "string", "description": "Optional image evidence URL" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Submission time" },
+        "updatedAt": { "type": "string", "format": "date-time", "description": "Last update time (e.g. when approved)" }
+      },
+      "required": ["reporterId", "location", "description", "status", "createdAt", "updatedAt"]
+    },
+    "DangerZone": {
+      "title": "DangerZone",
+      "description": "A verified unsafe area displayed on the map.",
+      "type": "object",
+      "properties": {
+        "location": { "type": "object", "description": "Geopoint: { lat, lng }" },
+        "radius": { "type": "number", "description": "Impact radius in meters" },
+        "description": { "type": "string", "description": "Reason for the danger zone" },
+        "addedBy": { "type": "string", "description": "UID of the admin who added this" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation time" },
+        "active": { "type": "boolean", "description": "Whether the zone is currently active" }
+      },
+      "required": ["location", "radius", "description", "addedBy", "createdAt", "active"]
+    },
+    "Notification": {
+      "title": "Notification",
+      "description": "In-app notification for users.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Target user UID" },
+        "message": { "type": "string", "description": "Notification content" },
+        "type": { "type": "string", "description": "Type of notification (status_update, alert)" },
+        "read": { "type": "boolean", "description": "Read status" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Timestamp" }
+      },
+      "required": ["userId", "message", "type", "read", "createdAt"]
+    },
+    "SavedPlace": {
+      "title": "SavedPlace",
+      "description": "A user-saved place for personalized navigation",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "UID of the owner who saved the place" },
+        "name": { "type": "string", "description": "Display name of the place, e.g. Home, School" },
+        "category": { "type": "string", "enum": ["home", "school", "work", "hospital", "store", "favorite", "custom"], "description": "Classification category" },
+        "icon": { "type": "string", "description": "Selected icon category description or emoji" },
+        "location": { "type": "object", "description": "Coordinates: { lat, lng }" },
+        "useCount": { "type": "number", "description": "Usage counter for sorting favorites first" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
+      },
+      "required": ["userId", "name", "category", "location", "useCount", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "Individual user profiles"
+    },
+    "/saved_places/{placeId}": {
+      "schema": "SavedPlace",
+      "description": "User saved locations"
+    },
+    "/reports/{reportId}": {
+      "schema": "Report",
+      "description": "Safety reports submitted by residents"
+    },
+    "/danger_zones/{zoneId}": {
+      "schema": "DangerZone",
+      "description": "Verified danger zones approved by admins"
+    },
+    "/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "User specific notifications"
+    }
+  }
+}

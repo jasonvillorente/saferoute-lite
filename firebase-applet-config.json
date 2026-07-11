@@ -1,0 +1,10 @@
+{
+  "projectId": "saferouteapp-admin",
+  "appId": "1:595516297133:web:ec7791a2e4e650198b5b24",
+  "apiKey": "AIzaSyBD-81VMnB-ba8EIi8PPBVG7r6exXUIbF0",
+  "authDomain": "saferouteapp-admin.firebaseapp.com",
+  "firestoreDatabaseId": "(default)",
+  "storageBucket": "saferouteapp-admin.firebasestorage.app",
+  "messagingSenderId": "595516297133",
+  "measurementId": ""
+}

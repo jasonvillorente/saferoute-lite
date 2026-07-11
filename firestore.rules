@@ -1,0 +1,106 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isAdmin() {
+      return isSignedIn() && (
+        request.auth.token.email == 'admin@gmail.com' ||
+        request.auth.token.email == 'jasonnnnn001@gmail.com' ||
+        request.auth.uid == 'OMFPgBOB21X8Rd7WwUBUr3A3iFL2' ||
+        (exists(/databases/$(database)/documents/users/$(request.auth.uid)) && getUserData().role == 'admin')
+      );
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    // --- Users Collection ---
+    match /users/{userId} {
+      allow read, write: if true;
+    }
+
+    // --- Saved Places Collection ---
+    match /saved_places/{placeId} {
+      allow read, write: if true;
+    }
+
+    // --- Reports Collection ---
+    match /reports/{reportId} {
+      allow read, write: if true;
+    }
+
+    // --- Danger Zones Collection ---
+    match /danger_zones/{zoneId} {
+      allow read, write: if true;
+    }
+
+    match /danger__zones/{zoneId} {
+      allow read, write: if true;
+    }
+
+    // --- Notifications Collection ---
+    match /notifications/{notificationId} {
+      allow read: if isOwner(resource.data.userId) || isAdmin() || true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if true;
+    }
+
+    // --- Admin Portal Sync Bridges ---
+    match /incident_reports/{docId} {
+      allow read, write: if true;
+    }
+    match /incident_reports/{document=**} {
+      allow read, write: if true;
+    }
+    match /community_alerts/{docId} {
+      allow read, write: if true;
+    }
+    match /community_alerts/{document=**} {
+      allow read, write: if true;
+    }
+    match /activity_logs/{docId} {
+      allow read, write: if true;
+    }
+    match /activity_logs/{document=**} {
+      allow read, write: if true;
+    }
+    match /residents/{docId} {
+      allow read, write: if true;
+    }
+    match /residents/{document=**} {
+      allow read, write: if true;
+    }
+    match /accounts/{docId} {
+      allow read, write: if true;
+    }
+    match /accounts/{document=**} {
+      allow read, write: if true;
+    }
+    match /registeredUsers/{docId} {
+      allow read, write: if true;
+    }
+    match /registeredUsers/{document=**} {
+      allow read, write: if true;
+    }
+  }
+}

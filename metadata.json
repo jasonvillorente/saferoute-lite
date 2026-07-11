@@ -1,0 +1,11 @@
+{
+  "name": "SafeRoute Lite",
+  "description": "A community safety mobile web app for barangays. Residents can report hazards, find safe routes avoiding danger zones, and admins can verify reports in real-time.",
+  "requestFramePermissions": [
+    "geolocation"
+  ],
+  "majorCapabilities": [
+    "realtime_collaboration",
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
