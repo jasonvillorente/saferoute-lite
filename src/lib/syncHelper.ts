@@ -26,13 +26,40 @@ export async function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: numb
  * Synchronizes user/resident registration data to all potential Firestore collections
  * that both the SafeRoute Lite app and the external Admin Portal might query.
  */
-export async function syncResidentToAllCollections(uid: string, name: string, email: string) {
+export async function syncResidentToAllCollections(
+  uid: string, 
+  name: string, 
+  email: string,
+  phoneNumber?: string,
+  authMethod?: 'email' | 'phone' | 'google'
+) {
+  const cleanPhone = phoneNumber ? phoneNumber.trim() : '';
+  const isPhone = authMethod === 'phone' || !!cleanPhone || email.includes('@phone.') || email.endsWith('.saferoute.ph');
+  const detectedAuthMethod: 'email' | 'phone' | 'google' = authMethod 
+    ? authMethod 
+    : (isPhone ? 'phone' : (email ? 'email' : 'phone'));
+  
+  const cleanEmail = email || (cleanPhone ? `${cleanPhone.replace(/[^0-9]/g, '')}@phone.saferoute.ph` : 'resident@saferoute.ph');
+
   // Try server-side synchronization first (100% reliable, bypassing client security rules & iframe blocks)
   try {
     const res = await fetch('/api/sync-resident', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uid, name, email })
+      body: JSON.stringify({ 
+        uid, 
+        name, 
+        email: cleanEmail,
+        phoneNumber: cleanPhone,
+        phone: cleanPhone,
+        mobileNumber: cleanPhone,
+        authMethod: detectedAuthMethod,
+        authProvider: detectedAuthMethod,
+        provider: detectedAuthMethod,
+        authType: detectedAuthMethod,
+        isPhoneAuth: detectedAuthMethod === 'phone',
+        phoneBridgeEmail: isPhone ? cleanEmail : undefined
+      })
     });
     if (res.ok) {
       const data = await res.json();
@@ -49,21 +76,36 @@ export async function syncResidentToAllCollections(uid: string, name: string, em
     console.warn('Backend resident sync route unavailable, falling back to direct Firestore write:', err);
   }
 
-  const payload = {
+  const payload: any = {
     uid,
     name,
-    email,
+    email: cleanEmail,
     role: 'resident',
     status: 'active',
+    authMethod: detectedAuthMethod,
+    authProvider: detectedAuthMethod,
+    provider: detectedAuthMethod,
+    authType: detectedAuthMethod,
+    isPhoneAuth: detectedAuthMethod === 'phone',
     createdAt: serverTimestamp(),
     updatedAt: serverTimestamp()
   };
+
+  if (isPhone) {
+    payload.phoneBridgeEmail = cleanEmail;
+  }
+
+  if (cleanPhone) {
+    payload.phoneNumber = cleanPhone;
+    payload.phone = cleanPhone;
+    payload.mobileNumber = cleanPhone;
+  }
 
   const collections = ['users', 'residents', 'registeredUsers', 'accounts'];
 
   const promises = collections.map(async (collName) => {
     try {
-      const writePromise = setDoc(doc(db, collName, uid), payload);
+      const writePromise = setDoc(doc(db, collName, uid), payload, { merge: true });
       // Give each write a strict 1.5-second timeout so offline/unconnected SDK won't hang the authentication flow
       await promiseWithTimeout(writePromise, 1500, null);
       console.log(`Successfully completed sync check for ${collName}/${uid}`);

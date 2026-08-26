@@ -5,7 +5,7 @@ import { useTheme } from '../context/ThemeContext';
 import { collection, query, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
-import { DangerZone, safeGetCoords } from '../types';
+import { DangerZone, safeGetCoords, isZoneResolved } from '../types';
 import { motion } from 'motion/react';
 
 // Helper to robustly resolve danger zone risk level from various fields set by the Admin Portal or app
@@ -61,12 +61,13 @@ export default function Home() {
   const [oscillator1, setOscillator1] = useState<OscillatorNode | null>(null);
   const [oscillator2, setOscillator2] = useState<OscillatorNode | null>(null);
   
-  // Emergency Hotlines list
+  // Emergency Hotlines list (Ahon Palanan Mobile Contacts)
   const hotlines = [
-    { name: 'Barangay Palanan Desk', phone: '02-8844-3118' },
-    { name: 'Makati Police HQ', phone: '02-8867-2292' },
-    { name: 'Makati Red Cross', phone: '02-8890-3491' },
-    { name: 'National Emergency', phone: '911' }
+    { name: 'Barangay Police (24/7)', phone: '0917-139-7288' },
+    { name: 'Barangay Office (8AM-5PM)', phone: '0917-140-0986' },
+    { name: 'Barangay Health Workers (8AM-5PM)', phone: '0917-140-2330' },
+    { name: 'Police Community Precinct (PCP) 2', phone: '0967-074-3962' },
+    { name: 'Bureau of Fire Protection (BFP)', phone: '0968-690-0785' }
   ];
 
   useEffect(() => {
@@ -77,23 +78,31 @@ export default function Home() {
       const mergedMap = new Map<string, DangerZone>();
       rawZones1.forEach(z => mergedMap.set(z.id, z));
       rawZones2.forEach(z => mergedMap.set(z.id, z));
-      setZones(Array.from(mergedMap.values()));
+      // Only keep active, non-resolved danger zones with valid coordinates
+      const activeUnresolved = Array.from(mergedMap.values()).filter(
+        z => z && z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number' && !isZoneResolved(z) && z.active !== false
+      );
+      setZones(activeUnresolved);
     };
 
     const unsubZones1 = onSnapshot(collection(db, 'danger_zones'), (snapshot) => {
       rawZones1 = snapshot.docs.map(docSnap => {
         const data = docSnap.data();
         const loc = safeGetCoords(data) || { lat: 14.56038, lng: 120.99800 };
-        const active = data.active !== undefined 
-          ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-          : (data.status === 'active' || data.status === 'approved');
+        const isResolved = isZoneResolved(data);
+        const active = !isResolved && (
+          data.active !== undefined 
+            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
+            : (data.status === 'active' || data.status === 'approved' || !data.status)
+        );
         const radius = Number(data.radius) || 100;
         return {
           id: docSnap.id,
           ...data,
           location: loc,
           radius,
-          active
+          active,
+          resolved: isResolved
         } as DangerZone;
       });
       updateMergedZones();
@@ -108,16 +117,20 @@ export default function Home() {
       rawZones2 = snapshot.docs.map(docSnap => {
         const data = docSnap.data();
         const loc = safeGetCoords(data) || { lat: 14.56038, lng: 120.99800 };
-        const active = data.active !== undefined 
-          ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-          : (data.status === 'active' || data.status === 'approved');
+        const isResolved = isZoneResolved(data);
+        const active = !isResolved && (
+          data.active !== undefined 
+            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
+            : (data.status === 'active' || data.status === 'approved' || !data.status)
+        );
         const radius = Number(data.radius) || 100;
         return {
           id: docSnap.id,
           ...data,
           location: loc,
           radius,
-          active
+          active,
+          resolved: isResolved
         } as DangerZone;
       });
       updateMergedZones();

@@ -57,6 +57,15 @@ service cloud.firestore {
       allow read, write: if true;
     }
 
+    // --- Community Spots Collection ---
+    match /community_spots/{spotId} {
+      allow read, write: if true;
+    }
+
+    match /communitySpots/{spotId} {
+      allow read, write: if true;
+    }
+
     // --- Notifications Collection ---
     match /notifications/{notificationId} {
       allow read: if isOwner(resource.data.userId) || isAdmin() || true;

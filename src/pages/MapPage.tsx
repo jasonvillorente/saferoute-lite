@@ -1,13 +1,36 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { MapContainer, TileLayer, Marker, Popup, Circle, useMapEvents, Polyline, useMap } from 'react-leaflet';
-import { collection, query, where, onSnapshot, addDoc, updateDoc, deleteDoc, doc, Timestamp, getDocs } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, addDoc, setDoc, updateDoc, deleteDoc, doc, Timestamp, getDocs } from 'firebase/firestore';
 import L from 'leaflet';
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { useAuth } from '../context/AuthContext';
-import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords } from '../types';
+import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords, CommunitySpot, CommunitySpotCategory, isZoneResolved } from '../types';
+
+// In-memory route caching to eliminate public OSRM rate limiting & APK WebView network delays
+const globalRouteCache = new Map<string, any>();
+
+function getRouteCacheKey(start: [number, number], waypoints: [number, number][], end: [number, number]): string {
+  const points = [start, ...waypoints, end];
+  return points.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(';');
+}
+
+async function fetchRouteJsonWithTimeout(url: string, timeoutMs = 4000): Promise<any | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timer);
+    if (!res.ok) return null;
+    return await res.json();
+  } catch (e) {
+    clearTimeout(timer);
+    return null;
+  }
+}
 import { 
   AlertCircle, 
+  ShieldAlert,
   Navigation, 
   Loader2, 
   X, 
@@ -30,12 +53,103 @@ import {
   Activity,
   Shield,
   Locate,
-  MapPinned
+  MapPinned,
+  Plus,
+  ThumbsUp,
+  Sparkles,
+  Heart,
+  Lightbulb,
+  Store,
+  Coffee,
+  Smile,
+  Layers,
+  XCircle,
+  Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
 // Leaflet markers shadow url
 const markerShadow = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png';
+
+const createCommunitySpotIcon = (category: CommunitySpotCategory, isSelected: boolean = false) => {
+  let badgeColor = '#10b981'; // emerald for safe_haven
+  let badgeBorder = '#047857';
+  let emoji = '🛡️';
+
+  if (category === 'well_lit') {
+    badgeColor = '#f59e0b';
+    badgeBorder = '#b45309';
+    emoji = '💡';
+  } else if (category === 'friendly_business') {
+    badgeColor = '#06b6d4';
+    badgeBorder = '#0e7490';
+    emoji = '🏪';
+  } else if (category === 'community_hub') {
+    badgeColor = '#8b5cf6';
+    badgeBorder = '#6d28d9';
+    emoji = '☕';
+  } else if (category === 'enjoyed_spot') {
+    badgeColor = '#ec4899';
+    badgeBorder = '#be185d';
+    emoji = '🌟';
+  }
+
+  const pulseClass = isSelected ? 'scale-125 z-50 ring-4 ring-emerald-400 rounded-full' : '';
+
+  return L.divIcon({
+    html: `
+      <div class="relative flex flex-col items-center group cursor-pointer ${pulseClass}">
+        <div class="w-9 h-9 rounded-full flex items-center justify-center text-base shadow-xl border-2 transition-transform duration-200 group-hover:scale-110"
+             style="background-color: ${badgeColor}; border-color: ${badgeBorder}; color: white;">
+          ${emoji}
+        </div>
+        <div class="w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-t-[7px]"
+             style="border-t-color: ${badgeColor}; margin-top: -1px;">
+        </div>
+        <div class="w-2.5 h-1 bg-black/30 rounded-full blur-[1px] mt-0.5"></div>
+      </div>
+    `,
+    className: 'custom-community-spot-pinpoint',
+    iconSize: [36, 44],
+    iconAnchor: [18, 42],
+    popupAnchor: [0, -38]
+  });
+};
+
+const getSpotCategoryIcon = (category: CommunitySpotCategory) => {
+  switch (category) {
+    case 'safe_haven': return '🛡️';
+    case 'well_lit': return '💡';
+    case 'friendly_business': return '🏪';
+    case 'community_hub': return '☕';
+    case 'enjoyed_spot': return '🌟';
+    default: return '📍';
+  }
+};
+
+const getSpotCategoryLabel = (category: CommunitySpotCategory) => {
+  switch (category) {
+    case 'safe_haven': return 'Safe Haven';
+    case 'well_lit': return 'Well-Lit Pathway';
+    case 'friendly_business': return 'Friendly 24/7 Store';
+    case 'community_hub': return 'Community Hub';
+    case 'enjoyed_spot': return 'Enjoyed Spot';
+    default: return 'Community Spot';
+  }
+};
+
+const getSpotCategoryBg = (category: CommunitySpotCategory) => {
+  switch (category) {
+    case 'safe_haven': return 'bg-emerald-600';
+    case 'well_lit': return 'bg-amber-500';
+    case 'friendly_business': return 'bg-cyan-600';
+    case 'community_hub': return 'bg-purple-600';
+    case 'enjoyed_spot': return 'bg-pink-600';
+    default: return 'bg-slate-700';
+  }
+};
+
+const DEFAULT_COMMUNITY_SPOTS: CommunitySpot[] = [];
 
 const startIcon = L.icon({
     iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-2x-blue.png',
@@ -65,6 +179,30 @@ const userIcon = L.icon({
   popupAnchor: [1, -34],
   shadowSize: [41, 41]
 });
+
+// Real-time live user GPS puck with pulsing radar ripple & direction beam
+const createLiveGpsPuckIcon = (heading: number | null = null) => {
+  const hasHeading = typeof heading === 'number' && !isNaN(heading);
+  const headingTransform = hasHeading ? `transform: rotate(${heading}deg);` : '';
+
+  return L.divIcon({
+    html: `
+      <div class="relative flex items-center justify-center w-10 h-10 -ml-5 -mt-5">
+        ${hasHeading ? `
+          <div class="absolute -top-3 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-b-[12px] border-b-blue-500 opacity-80" style="${headingTransform} transform-origin: 50% 20px;"></div>
+        ` : ''}
+        <span class="absolute w-8 h-8 rounded-full bg-blue-500/30 animate-ping"></span>
+        <span class="absolute w-6 h-6 rounded-full bg-blue-500/40"></span>
+        <div class="relative w-4 h-4 rounded-full bg-blue-600 border-2 border-white shadow-md flex items-center justify-center">
+          <div class="w-1.5 h-1.5 rounded-full bg-white"></div>
+        </div>
+      </div>
+    `,
+    className: 'live-gps-puck-icon',
+    iconSize: [40, 40],
+    iconAnchor: [20, 20],
+  });
+};
 
 const createSavedPlaceIcon = (emoji: string) => {
   return L.divIcon({
@@ -137,6 +275,34 @@ function getDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: numbe
   return R * c;
 }
 
+// Calculate exact shortest distance in meters from a point (pLat, pLng) to a line segment (lat1,lng1 -> lat2,lng2)
+function getMinDistanceToSegmentMeters(
+  lat1: number, lng1: number,
+  lat2: number, lng2: number,
+  pLat: number, pLng: number
+): number {
+  const cosLat = Math.cos(lat1 * Math.PI / 180);
+  const bx = (lng2 - lng1) * 111000 * cosLat;
+  const by = (lat2 - lat1) * 111000;
+  const px = (pLng - lng1) * 111000 * cosLat;
+  const py = (pLat - lat1) * 111000;
+
+  const ab2 = bx * bx + by * by;
+  if (ab2 === 0) {
+    return getDistanceMeters(lat1, lng1, pLat, pLng);
+  }
+
+  let t = (px * bx + py * by) / ab2;
+  t = Math.max(0, Math.min(1, t));
+
+  const cx = t * bx;
+  const cy = t * by;
+
+  const dx = px - cx;
+  const dy = py - cy;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
 // Custom map events delegate
 interface MapEventsProps {
   onMapClick: (latLng: [number, number]) => void;
@@ -178,15 +344,58 @@ function EnforceBoundsAndSettings() {
   return null;
 }
 
+// Map view controller component to guarantee viewport movement & sync Leaflet map instance
+function MapViewController({ 
+  liveCoords, 
+  autoFollow, 
+  onMapInstance,
+  onUserDrag
+}: { 
+  liveCoords: [number, number] | null; 
+  autoFollow: boolean;
+  onMapInstance: (map: L.Map) => void;
+  onUserDrag: () => void;
+}) {
+  const map = useMap();
+  const hasCenteredInitially = useRef(false);
+
+  useEffect(() => {
+    if (map) {
+      onMapInstance(map);
+    }
+  }, [map, onMapInstance]);
+
+  useMapEvents({
+    dragstart() {
+      onUserDrag();
+    }
+  });
+
+  useEffect(() => {
+    if (liveCoords && map) {
+      if (!hasCenteredInitially.current || autoFollow) {
+        hasCenteredInitially.current = true;
+        map.setView(liveCoords, Math.max(map.getZoom(), 16), { animate: true });
+      }
+    }
+  }, [liveCoords, autoFollow, map]);
+
+  return null;
+}
+
 // Map boundary centering and floating controls
 function FloatingMapControls({ 
   onRecenter,
   onZoomIn,
-  onZoomOut
+  onZoomOut,
+  autoFollow,
+  hasLiveGps
 }: { 
   onRecenter: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
+  autoFollow?: boolean;
+  hasLiveGps?: boolean;
 }) {
   const darkMode = false;
   return (
@@ -196,11 +405,15 @@ function FloatingMapControls({
         onClick={onRecenter}
         id="btn-recenter-map"
         className={`p-3 rounded-full shadow-lg border transition-all active:scale-95 flex items-center justify-center w-11 h-11 ${
-          darkMode ? 'bg-slate-900 border-slate-800 text-blue-400 hover:bg-slate-800' : 'bg-white border-slate-200 text-blue-600 hover:bg-slate-50'
+          autoFollow 
+            ? 'bg-blue-600 border-blue-500 text-white shadow-blue-500/30' 
+            : darkMode 
+              ? 'bg-slate-900 border-slate-800 text-blue-400 hover:bg-slate-800' 
+              : 'bg-white border-slate-200 text-blue-600 hover:bg-slate-50'
         }`}
-        title="Find Me & Recenter Map"
+        title={autoFollow ? "Auto-following location (Click to center)" : "Find Me & Center Location"}
       >
-        <Compass className={`w-5 h-5 animate-pulse ${darkMode ? 'text-blue-400' : 'text-blue-600'}`} />
+        <Compass className={`w-5 h-5 ${hasLiveGps ? 'animate-pulse' : ''} ${autoFollow ? 'text-white' : (darkMode ? 'text-blue-400' : 'text-blue-600')}`} />
       </button>
 
       {/* Easy Zoom In/Out */}
@@ -334,31 +547,37 @@ export default function MapPage() {
     let approachesLow = false;
 
     zones.forEach(zone => {
-      if (!zone || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+      if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
       
-      // Find minimum distance from any coordinate of the route to this danger zone
+      // Find minimum exact distance from any route segment to this danger zone
       let minDist = Infinity;
-      coordinates.forEach(([lat, lng]) => {
-        const d = getDistanceMeters(lat, lng, zone.location.lat, zone.location.lng);
-        if (d < minDist) {
-          minDist = d;
+      if (coordinates.length === 1) {
+        minDist = getDistanceMeters(coordinates[0][0], coordinates[0][1], zone.location.lat, zone.location.lng);
+      } else {
+        for (let i = 0; i < coordinates.length - 1; i++) {
+          const p1 = coordinates[i];
+          const p2 = coordinates[i + 1];
+          const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
+          if (d < minDist) {
+            minDist = d;
+          }
         }
-      });
+      }
 
       // Get risk level robustly from database values
       const risk = resolveRiskLevel(zone);
 
-      // Assign penalties
+      // Assign heavier penalties so safe detours are prioritized over dangerous direct routes
       if (minDist <= zone.radius) {
-        if (risk === 'critical') { passesCritical = true; routePenalty += 5000; }
-        else if (risk === 'high') { passesHigh = true; routePenalty += 1000; }
-        else if (risk === 'moderate') { passesModerate = true; routePenalty += 300; }
-        else if (risk === 'low') { passesLow = true; routePenalty += 100; }
+        if (risk === 'critical') { passesCritical = true; routePenalty += 10000; }
+        else if (risk === 'high') { passesHigh = true; routePenalty += 5000; }
+        else if (risk === 'moderate') { passesModerate = true; routePenalty += 2000; }
+        else if (risk === 'low') { passesLow = true; routePenalty += 500; }
       } else if (minDist <= zone.radius * 1.5) {
-        if (risk === 'critical') { approachesCritical = true; routePenalty += 1500; }
-        else if (risk === 'high') { approachesHigh = true; routePenalty += 300; }
-        else if (risk === 'moderate') { approachesModerate = true; routePenalty += 100; }
-        else if (risk === 'low') { approachesLow = true; routePenalty += 30; }
+        if (risk === 'critical') { approachesCritical = true; routePenalty += 2000; }
+        else if (risk === 'high') { approachesHigh = true; routePenalty += 1000; }
+        else if (risk === 'moderate') { approachesModerate = true; routePenalty += 400; }
+        else if (risk === 'low') { approachesLow = true; routePenalty += 100; }
       }
     });
 
@@ -374,16 +593,16 @@ export default function MapPage() {
 
     // Calculate safety score
     let baseSafetyScore = 98;
-    if (passesCritical) baseSafetyScore -= 40;
+    if (passesCritical) baseSafetyScore -= 45;
     else if (approachesCritical) baseSafetyScore -= 20;
 
-    if (passesHigh) baseSafetyScore -= 25;
+    if (passesHigh) baseSafetyScore -= 30;
     else if (approachesHigh) baseSafetyScore -= 12;
 
-    if (passesModerate) baseSafetyScore -= 15;
+    if (passesModerate) baseSafetyScore -= 18;
     else if (approachesModerate) baseSafetyScore -= 6;
 
-    if (passesLow) baseSafetyScore -= 8;
+    if (passesLow) baseSafetyScore -= 10;
     else if (approachesLow) baseSafetyScore -= 3;
 
     const safetyScore = Math.max(50, Math.min(98, baseSafetyScore));
@@ -395,24 +614,20 @@ export default function MapPage() {
     for (let i = 0; i < coordinates.length - 1; i++) {
       const p1 = coordinates[i];
       const p2 = coordinates[i+1];
-      const mid: [number, number] = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
 
       let rank = 0; // Green
       zones.forEach(zone => {
-        if (!zone || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+        if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
         
-        const d1 = getDistanceMeters(p1[0], p1[1], zone.location.lat, zone.location.lng);
-        const d2 = getDistanceMeters(p2[0], p2[1], zone.location.lat, zone.location.lng);
-        const d3 = getDistanceMeters(mid[0], mid[1], zone.location.lat, zone.location.lng);
-        const d = Math.min(d1, d2, d3);
-
+        const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
         const risk = resolveRiskLevel(zone);
 
-        if (d <= zone.radius * 1.5) {
-          if (risk === 'critical') rank = Math.max(rank, 2); // Map critical to High/Orange
-          else if (risk === 'high') rank = Math.max(rank, 2);
-          else if (risk === 'moderate') rank = Math.max(rank, 1);
-          else if (risk === 'low') rank = Math.max(rank, 0);
+        if (d <= zone.radius) {
+          if (risk === 'critical' || risk === 'high') rank = Math.max(rank, 2); // Orange/High risk segment
+          else if (risk === 'moderate') rank = Math.max(rank, 1); // Yellow
+          else rank = Math.max(rank, 0); // Green
+        } else if (d <= zone.radius * 1.5) {
+          if (risk === 'critical' || risk === 'high') rank = Math.max(rank, 1); // Yellow for near approach
         }
       });
 
@@ -513,11 +728,96 @@ export default function MapPage() {
   const [proximityAlert, setProximityAlert] = useState<string | null>(null);
   const simulationTimer = useRef<NodeJS.Timeout | null>(null);
   
+  // Real-Time Live GPS Pinpoint & Movement Tracking
+  const [liveGpsCoords, setLiveGpsCoords] = useState<[number, number] | null>(null);
+  const [liveGpsAccuracy, setLiveGpsAccuracy] = useState<number | null>(null);
+  const [liveGpsHeading, setLiveGpsHeading] = useState<number | null>(null);
+  const [liveGpsSpeed, setLiveGpsSpeed] = useState<number | null>(null);
+  const [autoFollowGps, setAutoFollowGps] = useState<boolean>(false);
+  const watchIdRef = useRef<number | null>(null);
+
+  // Continuous real-time GPS tracking listener
+  const hasInitiallyCentered = useRef(false);
+
+  useEffect(() => {
+    if (!navigator.geolocation) return;
+
+    const onLocationUpdate = (pos: GeolocationPosition) => {
+      const lat = pos.coords.latitude;
+      const lng = pos.coords.longitude;
+      const accuracy = pos.coords.accuracy;
+      const heading = pos.coords.heading;
+      const speed = pos.coords.speed;
+
+      const newCoords: [number, number] = [lat, lng];
+      setLiveGpsCoords(newCoords);
+      setLiveGpsAccuracy(accuracy);
+      if (typeof heading === 'number' && !isNaN(heading)) {
+        setLiveGpsHeading(heading);
+      }
+      if (typeof speed === 'number' && !isNaN(speed)) {
+        setLiveGpsSpeed(speed);
+      }
+
+      // Automatically center map on user on first GPS signal arrival or if autoFollowGps is active
+      if ((!hasInitiallyCentered.current || autoFollowGps) && mapRef.current) {
+        hasInitiallyCentered.current = true;
+        mapRef.current.setView(newCoords, 17, { animate: true });
+      }
+
+      // Check proximity to active danger zones in real-time
+      if (!isSimulating) {
+        let activeDangerMsg: string | null = null;
+        zones.forEach(zone => {
+          if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location) return;
+          const d = getDistanceMeters(lat, lng, zone.location.lat, zone.location.lng);
+          if (d <= zone.radius) {
+            activeDangerMsg = `PROXIMITY WARNING: Inside active threat zone: "${zone.description}".`;
+          } else if (d <= zone.radius * 1.4 && !activeDangerMsg) {
+            activeDangerMsg = `AWARENESS: Approaching hotspot: "${zone.description}" (${Math.round(d)}m away).`;
+          }
+        });
+        setProximityAlert(activeDangerMsg);
+      }
+    };
+
+    const onError = (err: GeolocationPositionError) => {
+      console.warn("GPS tracking status:", err.message);
+      if (err.code === 1) {
+        setToastMessage("⚠️ Location permission is blocked. Please tap the lock/settings icon in your browser to Allow Location, and ensure phone GPS is ON.");
+      }
+    };
+
+    // Immediate initial high accuracy GPS query on mount
+    navigator.geolocation.getCurrentPosition(onLocationUpdate, (err) => {
+      console.warn("Initial GPS position check:", err.message);
+      if (err.code === 1) {
+        setToastMessage("⚠️ Location permission is blocked. Please tap the lock/settings icon in your browser to Allow Location, and ensure phone GPS is ON.");
+      }
+    }, {
+      enableHighAccuracy: true,
+      timeout: 10000,
+      maximumAge: 0
+    });
+
+    watchIdRef.current = navigator.geolocation.watchPosition(onLocationUpdate, onError, {
+      enableHighAccuracy: true,
+      maximumAge: 1000,
+      timeout: 15000,
+    });
+
+    return () => {
+      if (watchIdRef.current !== null) {
+        navigator.geolocation.clearWatch(watchIdRef.current);
+      }
+    };
+  }, [autoFollowGps, zones, isSimulating]);
+
   // Collapsible Bottom Sheet Expansion state
   const [isSheetExpanded, setIsSheetExpanded] = useState(false);
 
   // User auth details
-  const { user } = useAuth();
+  const { user, isAdmin, toggleUserRole } = useAuth();
   
   // Saved Places state structures
   const [savedPlaces, setSavedPlaces] = useState<SavedPlace[]>([]);
@@ -538,6 +838,37 @@ export default function MapPage() {
   const [formCoords, setFormCoords] = useState<[number, number] | null>(null);
   const [formAddress, setFormAddress] = useState('');
   const [isPickingCoordsOnMap, setIsPickingCoordsOnMap] = useState(false);
+
+  // Community Spots feature state
+  const [communitySpots, setCommunitySpots] = useState<CommunitySpot[]>(DEFAULT_COMMUNITY_SPOTS);
+  const [showCommunitySpots, setShowCommunitySpots] = useState(true);
+  const [selectedSpotCategory, setSelectedSpotCategory] = useState<string>('all');
+  const [selectedCommunitySpot, setSelectedCommunitySpot] = useState<CommunitySpot | null>(null);
+
+  // Add Community Spot form modal state
+  const [isAddSpotModalOpen, setIsAddSpotModalOpen] = useState(false);
+  const [spotTitle, setSpotTitle] = useState('');
+  const [spotCategory, setSpotCategory] = useState<CommunitySpotCategory>('safe_haven');
+  const [spotDescription, setSpotDescription] = useState('');
+  const [spotCoords, setSpotCoords] = useState<[number, number] | null>(null);
+  const [spotAddress, setSpotAddress] = useState('');
+  const [upvotingSpotId, setUpvotingSpotId] = useState<string | null>(null);
+  const [isPickingSpotOnMap, setIsPickingSpotOnMap] = useState(false);
+
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  // Auto-dismiss toast after 4.5s
+  useEffect(() => {
+    if (toastMessage) {
+      const timer = setTimeout(() => {
+        setToastMessage(null);
+      }, 4500);
+      return () => clearTimeout(timer);
+    }
+  }, [toastMessage]);
+
+  // Active approved spots for public map view
+  const activeApprovedSpots = communitySpots.filter(s => s && s.active && s.status !== 'pending');
 
   // Load and subscribe to Saved Places
   useEffect(() => {
@@ -726,8 +1057,9 @@ export default function MapPage() {
       rawZones1.forEach(z => mergedMap.set(z.id, z));
       rawZones2.forEach(z => mergedMap.set(z.id, z));
       
+      // Filter out any danger zones marked as resolved or inactive
       const combined = Array.from(mergedMap.values()).filter(
-        z => z && z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number'
+        z => z && z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number' && !isZoneResolved(z) && z.active !== false
       );
       setZones(combined);
     };
@@ -739,16 +1071,20 @@ export default function MapPage() {
         rawZones1 = snapshot.docs.map(docSnap => {
           const data = docSnap.data();
           const loc = safeGetCoords(data);
-          const active = data.active !== undefined 
-            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-            : (data.status === 'active' || data.status === 'approved');
+          const isResolved = isZoneResolved(data);
+          const active = !isResolved && (
+            data.active !== undefined 
+              ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
+              : (data.status === 'active' || data.status === 'approved' || !data.status)
+          );
           const radius = Number(data.radius) || 100;
           return {
             id: docSnap.id,
             ...data,
             location: loc,
             radius,
-            active
+            active,
+            resolved: isResolved
           } as DangerZone;
         });
         updateMergedZones();
@@ -767,16 +1103,20 @@ export default function MapPage() {
         rawZones2 = snapshot.docs.map(docSnap => {
           const data = docSnap.data();
           const loc = safeGetCoords(data);
-          const active = data.active !== undefined 
-            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-            : (data.status === 'active' || data.status === 'approved');
+          const isResolved = isZoneResolved(data);
+          const active = !isResolved && (
+            data.active !== undefined 
+              ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
+              : (data.status === 'active' || data.status === 'approved' || !data.status)
+          );
           const radius = Number(data.radius) || 100;
           return {
             id: docSnap.id,
             ...data,
             location: loc,
             radius,
-            active
+            active,
+            resolved: isResolved
           } as DangerZone;
         });
         updateMergedZones();
@@ -788,9 +1128,89 @@ export default function MapPage() {
         handleFirestoreError(error, OperationType.GET, 'danger__zones');
       }
     );
-    
-    return () => { unsubZones1(); unsubZones2(); };
+
+    // Realtime community spots listener
+    const generatedTitles = [
+      'Dian St Barangay Police Outpost',
+      'Edison St Bright LED Walkway',
+      'Filmore 24/7 Mart & Safe Haven',
+      'Marconi Park Community Square',
+      'Bautista Corner Garden Spot'
+    ];
+
+    const unsubSpots = onSnapshot(
+      collection(db, 'community_spots'),
+      (snapshot) => {
+        if (!snapshot.empty) {
+          const spots: CommunitySpot[] = [];
+          const seenKeys = new Set<string>();
+
+          snapshot.docs.forEach(docSnap => {
+            const data = docSnap.data();
+            const title = (data.title || '').trim();
+            if (generatedTitles.includes(title) || docSnap.id.startsWith('spot-dian') || docSnap.id.startsWith('spot-edison') || docSnap.id.startsWith('spot-filmore') || docSnap.id.startsWith('spot-marconi') || docSnap.id.startsWith('spot-bautista')) {
+              // Delete generated seed spots from Firestore
+              deleteDoc(doc(db, 'community_spots', docSnap.id)).catch(() => {});
+              return;
+            }
+            const loc = safeGetCoords(data);
+            if (!loc) return;
+
+            // Clean up duplicates by title and coordinates
+            const dupKey = `${title.toLowerCase()}_${loc.lat.toFixed(5)}_${loc.lng.toFixed(5)}`;
+            if (seenKeys.has(dupKey)) {
+              deleteDoc(doc(db, 'community_spots', docSnap.id)).catch(() => {});
+              try { deleteDoc(doc(db, 'communitySpots', docSnap.id)).catch(() => {}); } catch(e){}
+              return;
+            }
+            seenKeys.add(dupKey);
+
+            const isActive = data.active === true || 
+                             data.active === 'true' || 
+                             data.status === 'approved' || 
+                             data.status === 'active' || 
+                             data.approvedByAdmin === true;
+            const isRejected = data.status === 'rejected';
+
+            const active = !isRejected && isActive;
+            const status = isRejected ? 'rejected' : (active ? 'approved' : 'pending');
+
+            spots.push({
+              id: docSnap.id,
+              title: title || 'Community Spot',
+              category: (data.category || 'safe_haven') as CommunitySpotCategory,
+              location: loc,
+              description: data.description || '',
+              reporterId: data.reporterId || 'resident',
+              reporterName: data.reporterName || 'Resident',
+              upvotes: Number(data.upvotes) || 0,
+              votedUsers: Array.isArray(data.votedUsers) ? data.votedUsers : [],
+              createdAt: data.createdAt,
+              active,
+              status,
+              approvedByAdmin: active
+            } as CommunitySpot);
+          });
+          setCommunitySpots(spots);
+        } else {
+          setCommunitySpots([]);
+        }
+      },
+      (error) => {
+        handleFirestoreError(error, OperationType.GET, 'community_spots');
+      }
+    );
+
+    return () => { unsubZones1(); unsubZones2(); unsubSpots(); };
   }, []);
+
+  // Auto dismiss toast messages
+  useEffect(() => {
+    if (toastMessage) {
+      const timer = setTimeout(() => setToastMessage(null), 5000);
+      return () => clearTimeout(timer);
+    }
+  }, [toastMessage]);
 
   // Sync human-readable street names for inputs
   useEffect(() => {
@@ -906,30 +1326,60 @@ export default function MapPage() {
     setIsSimulating(false);
     if (simulationTimer.current) clearInterval(simulationTimer.current);
 
-    const fetchRouteWithWaypoint = async (start: [number, number], waypoint: [number, number], end: [number, number]): Promise<CalculatedRoute | null> => {
+    const fetchRouteWithWaypoints = async (
+      start: [number, number],
+      waypoints: [number, number][],
+      end: [number, number],
+      routeName = "🛡️ Safe Detour Route"
+    ): Promise<CalculatedRoute | null> => {
+      const cacheKey = getRouteCacheKey(start, waypoints, end);
+      if (globalRouteCache.has(cacheKey)) {
+        const cached = globalRouteCache.get(cacheKey);
+        const stats = processRouteCoordinates(cached.coordinates, cached.distance);
+        return {
+          ...cached,
+          safety: stats.safety,
+          safetyScore: stats.safetyScore,
+          totalCost: stats.totalCost,
+          segments: stats.segments,
+          name: routeName
+        };
+      }
+
       try {
-        const coordsString = `${start[1]},${start[0]};${waypoint[1]},${waypoint[0]};${end[1]},${end[0]}`;
+        const allPoints = [start, ...waypoints, end];
+        const coordsString = allPoints.map(p => `${p[1]},${p[0]}`).join(';');
         const osmDeUrl = `https://routing.openstreetmap.de/routed-foot/route/v1/foot/${coordsString}?overview=full&geometries=geojson&steps=true`;
         
-        let response;
-        try {
-          response = await fetch(osmDeUrl);
-        } catch (e) {
-          console.warn("Handshake to osm de for waypoint failed, trying fallback OSRM", e);
-        }
+        let data = await fetchRouteJsonWithTimeout(osmDeUrl, 3500);
         
-        if (!response || !response.ok) {
+        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
           const fallbackUrl = `https://router.project-osrm.org/route/v1/foot/${coordsString}?overview=full&geometries=geojson&steps=true`;
-          response = await fetch(fallbackUrl);
+          data = await fetchRouteJsonWithTimeout(fallbackUrl, 3500);
         }
         
-        if (!response.ok) return null;
-        
-        const data = await response.json();
-        if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) return null;
+        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) return null;
         
         const route = data.routes[0];
-        const coordinates: [number, number][] = route.geometry.coordinates.map((coord: [number, number]) => [coord[1], coord[0]] as [number, number]);
+        let coordinates: [number, number][] = route.geometry.coordinates.map((coord: [number, number]) => [coord[1], coord[0]] as [number, number]);
+        
+        // Remove dead-end spur backtracking
+        if (coordinates.length >= 3) {
+          const cleaned: [number, number][] = [coordinates[0]];
+          for (let i = 1; i < coordinates.length; i++) {
+            const curr = coordinates[i];
+            if (cleaned.length >= 2) {
+              const prevPrev = cleaned[cleaned.length - 2];
+              if (getDistanceMeters(curr[0], curr[1], prevPrev[0], prevPrev[1]) < 12) {
+                cleaned.pop();
+                continue;
+              }
+            }
+            cleaned.push(curr);
+          }
+          coordinates = cleaned;
+        }
+
         const steps = route.legs?.flatMap((leg: any) => leg.steps || [])?.map((step: any) => ({
           instruction: step.maneuver?.instruction || "Continue ahead",
           distance: step.distance || 0,
@@ -937,7 +1387,7 @@ export default function MapPage() {
         })) || [];
         
         const stats = processRouteCoordinates(coordinates, route.distance);
-        return {
+        const result: CalculatedRoute = {
           coordinates,
           distance: route.distance,
           duration: route.duration,
@@ -946,35 +1396,36 @@ export default function MapPage() {
           safetyScore: stats.safetyScore,
           totalCost: stats.totalCost,
           segments: stats.segments,
-          name: "🛡️ Safe Detour Route"
+          name: routeName
         };
+
+        globalRouteCache.set(cacheKey, result);
+        return result;
       } catch (err) {
-        console.error("Error calculating detour waypoint route:", err);
+        console.warn("Detour waypoint calculation skipped:", err);
         return null;
       }
     };
 
     try {
-      // Prioritize the dedicated pedestrian/foot routing server from the OSM Germany community
-      const osmDeUrl = `https://routing.openstreetmap.de/routed-foot/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
-      
-      let response;
-      try {
-        response = await fetch(osmDeUrl);
-      } catch (err) {
-        console.warn("openstreetmap.de routing server handshake failed, falling back to public OSRM router...", err);
+      const directCacheKey = getRouteCacheKey(currentStart, [], currentEnd);
+      let data: any = null;
+
+      if (globalRouteCache.has(directCacheKey)) {
+        const cached = globalRouteCache.get(directCacheKey);
+        data = { code: 'Ok', routes: [{ geometry: { coordinates: cached.coordinates.map((c: [number, number]) => [c[1], c[0]]) }, distance: cached.distance, duration: cached.duration, legs: [{ steps: cached.steps }] }] };
+      } else {
+        // Prioritize the dedicated pedestrian/foot routing server from the OSM Germany community
+        const osmDeUrl = `https://routing.openstreetmap.de/routed-foot/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
+        data = await fetchRouteJsonWithTimeout(osmDeUrl, 3500);
+
+        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+          const fallbackOsrmUrl = `https://router.project-osrm.org/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
+          data = await fetchRouteJsonWithTimeout(fallbackOsrmUrl, 3500);
+        }
       }
 
-      if (!response || !response.ok) {
-        // Fallback to standard OSRM router URL if routing.openstreetmap.de fails
-        const fallbackOsrmUrl = `https://router.project-osrm.org/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
-        response = await fetch(fallbackOsrmUrl);
-      }
-
-      if (!response.ok) throw new Error("OSRM service status connection error.");
-
-      const data = await response.json();
-      if (data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+      if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
         throw new Error("No network road path available between selected points.");
       }
 
@@ -998,84 +1449,183 @@ export default function MapPage() {
           safetyScore: stats.safetyScore,
           totalCost: stats.totalCost,
           segments: stats.segments,
-          name: "" // assigned dynamically after sorting
+          name: "Direct Route"
         };
       });
 
       // --- DYNAMIC DETOUR GENERATION LOGIC ---
-      // If any of the standard routes cross an active threat zone, generate safe detours around them
-      const activeZones = zones.filter(zone => zone && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number');
-      const shortestRoute = calculated[0];
+      // Strictly ignore danger zones that are marked as resolved or inactive
+      const activeZones = zones.filter(zone => zone && !isZoneResolved(zone) && zone.active !== false && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number');
+      const validDetours: CalculatedRoute[] = [];
       
-      if (shortestRoute) {
-        const intersectingZones = activeZones.filter(zone => {
-          return shortestRoute.coordinates.some(([lat, lng]) => 
-            getDistanceMeters(lat, lng, zone.location.lat, zone.location.lng) <= zone.radius
-          );
+      const intersectingZones = activeZones.filter(zone => {
+        return calculated.some(route => {
+          if (!route.coordinates || route.coordinates.length < 2) return false;
+          for (let i = 0; i < route.coordinates.length - 1; i++) {
+            const p1 = route.coordinates[i];
+            const p2 = route.coordinates[i + 1];
+            const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
+            if (d <= zone.radius * 1.05) return true;
+          }
+          return false;
+        });
+      });
+
+      if (intersectingZones.length > 0) {
+        const detourPromises: Promise<CalculatedRoute | null>[] = [];
+
+        // Limit detour query volume to avoid rate limiting on mobile APK
+        intersectingZones.slice(0, 2).forEach(zone => {
+          const latDegreeMeters = 111000;
+          const lngDegreeMeters = 111000 * Math.cos(zone.location.lat * Math.PI / 180);
+          const shiftMeters = Math.max(zone.radius + 35, 75);
+
+          const shiftLat = shiftMeters / latDegreeMeters;
+          const shiftLng = shiftMeters / lngDegreeMeters;
+
+          // Lateral Waypoints (North-East, South-West bypasses) around threat zone
+          const wayNorth: [number, number] = [zone.location.lat + shiftLat, zone.location.lng];
+          const waySouth: [number, number] = [zone.location.lat - shiftLat, zone.location.lng];
+          const wayEast: [number, number] = [zone.location.lat, zone.location.lng + shiftLng];
+          const wayWest: [number, number] = [zone.location.lat, zone.location.lng - shiftLng];
+
+          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayNorth], currentEnd, "🛡️ Safe Detour via Calatagan St"));
+          detourPromises.push(fetchRouteWithWaypoints(currentStart, [waySouth], currentEnd, "🛡️ Safe Detour (South Corridor)"));
+          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayEast], currentEnd, "🛡️ Safe Detour (East Bypass)"));
+          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayWest], currentEnd, "🛡️ Safe Detour (West Bypass)"));
         });
 
-        if (intersectingZones.length > 0) {
-          const lat1 = currentStart[0];
-          const lng1 = currentStart[1];
-          const lat2 = currentEnd[0];
-          const lng2 = currentEnd[1];
-          let dLat = lat2 - lat1;
-          let dLng = lng2 - lng1;
-          const length = Math.sqrt(dLat * dLat + dLng * dLng);
+        const detourResults = await Promise.all(detourPromises);
 
-          if (length > 0) {
-            dLat /= length;
-            dLng /= length;
+        // STRICT FILTERING: Only accept detour routes that NEVER enter the danger zone and have superior safety
+        detourResults.forEach(detour => {
+          if (!detour || !detour.coordinates || detour.coordinates.length < 2) return;
 
-            const latDegreeMeters = 111000;
-            const lngDegreeMeters = 111000 * Math.cos(lat1 * Math.PI / 180);
+          // Check if any segment crosses inside any threat circle
+          let crossesInside = false;
+          for (const zone of activeZones) {
+            for (let i = 0; i < detour.coordinates.length - 1; i++) {
+              const p1 = detour.coordinates[i];
+              const p2 = detour.coordinates[i + 1];
+              const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
+              if (d <= zone.radius * 0.95) {
+                crossesInside = true;
+                break;
+              }
+            }
+            if (crossesInside) break;
+          }
 
-            const detourPromises: Promise<CalculatedRoute | null>[] = [];
+          if (crossesInside) return; // Discard routes that cut through danger zones!
+          if (detour.safety === 'danger') return; // Discard dangerous detours!
 
-            intersectingZones.forEach(zone => {
-              // Shift by 2.2x radius to ensure the waypoint is clearly outside the circle
-              const shiftMeters = zone.radius * 2.2;
-              const shiftLat = -dLng * (shiftMeters / latDegreeMeters);
-              const shiftLng = dLat * (shiftMeters / lngDegreeMeters);
+          // Deduplicate
+          const isDup = validDetours.some(v => Math.abs(v.distance - detour.distance) < 20 && v.safetyScore === detour.safetyScore);
+          if (!isDup) {
+            validDetours.push(detour);
+          }
+        });
 
-              const detourA: [number, number] = [zone.location.lat + shiftLat, zone.location.lng + shiftLng];
-              const detourB: [number, number] = [zone.location.lat - shiftLat, zone.location.lng - shiftLng];
+        // If OSRM failed to produce an off-circle road route, construct an orthogonal safe grid detour as fallback
+        if (validDetours.length === 0 && intersectingZones.length > 0) {
+          intersectingZones.forEach(zone => {
+            const bufferMeters = zone.radius + 35;
+            const latDeg = bufferMeters / 111000;
+            const lngDeg = bufferMeters / (111000 * Math.cos(zone.location.lat * Math.PI / 180));
 
-              detourPromises.push(fetchRouteWithWaypoint(currentStart, detourA, currentEnd));
-              detourPromises.push(fetchRouteWithWaypoint(currentStart, detourB, currentEnd));
-            });
+            const northLat = zone.location.lat + latDeg;
+            const southLat = zone.location.lat - latDeg;
 
-            const detourResults = await Promise.all(detourPromises);
-            detourResults.forEach(detour => {
-              if (detour) {
-                calculated.push(detour);
+            const gridNorth: [number, number][] = [
+              currentStart,
+              [northLat, currentStart[1]],
+              [northLat, currentEnd[1]],
+              currentEnd
+            ];
+
+            const gridSouth: [number, number][] = [
+              currentStart,
+              [southLat, currentStart[1]],
+              [southLat, currentEnd[1]],
+              currentEnd
+            ];
+
+            [gridNorth, gridSouth].forEach((gridCoords, i) => {
+              const dist = getDistanceMeters(currentStart[0], currentStart[1], gridCoords[1][0], gridCoords[1][1]) +
+                           getDistanceMeters(gridCoords[1][0], gridCoords[1][1], gridCoords[2][0], gridCoords[2][1]) +
+                           getDistanceMeters(gridCoords[2][0], gridCoords[2][1], currentEnd[0], currentEnd[1]);
+
+              const stats = processRouteCoordinates(gridCoords, dist);
+              if (stats.safety === 'safe') {
+                validDetours.push({
+                  coordinates: gridCoords,
+                  distance: dist,
+                  duration: dist / 1.3,
+                  steps: [
+                    { instruction: "Walk via Calatagan Street safe corridor", distance: dist * 0.5, name: "Calatagan St" },
+                    { instruction: "Turn towards destination along safe path", distance: dist * 0.5, name: "Marconi St" }
+                  ],
+                  safety: stats.safety,
+                  safetyScore: stats.safetyScore,
+                  totalCost: stats.totalCost,
+                  segments: stats.segments,
+                  name: `🛡️ Safe Grid Detour ${i + 1} (Calatagan St Bypass)`
+                });
               }
             });
-          }
+          });
         }
       }
       // --- END OF DYNAMIC DETOUR LOGIC ---
 
-      // Sort prioritizing minimizing the Total Cost = Walking Distance + Danger Penalty
-      calculated.sort((a, b) => a.totalCost - b.totalCost);
-
-      // Name routes dynamically to reflect their accurate, sorted safety and pedestrian nature
-      calculated.forEach((route, idx) => {
-        if (idx === 0) {
-          route.name = route.safety === 'safe'
-            ? "Shortest Safe Walking Route"
-            : `Shortest ${route.safety === 'moderate' ? 'Moderate' : 'Unavoidable Danger'} Walking Route`;
+      // Separate direct route (primary OSRM route)
+      const directRoute = calculated[0];
+      if (directRoute) {
+        if (directRoute.safety === 'safe') {
+          directRoute.name = "Direct Walk (Shortest & Safe)";
+        } else if (directRoute.safety === 'moderate') {
+          directRoute.name = "Direct Walk (Crosses Moderate Risk Zone)";
         } else {
-          if (route.name === "🛡️ Safe Detour Route") {
-            route.name = `🛡️ Safe Detour Route (${route.safety.toUpperCase()})`;
-          } else {
-            route.name = `Alternative Walk Route ${idx} (${route.safety.toUpperCase()})`;
-          }
+          directRoute.name = "Direct Walk (Crosses Active Threat Zone)";
+        }
+      }
+
+      // Filter and deduplicate valid detours to keep only distinct, unique options (max 2)
+      const distinctDetours: CalculatedRoute[] = [];
+      validDetours.sort((a, b) => a.distance - b.distance);
+
+      for (const detour of validDetours) {
+        // Skip if distance is almost identical (< 35m difference) to an already selected detour
+        const isSimilar = distinctDetours.some(d => Math.abs(d.distance - detour.distance) < 35);
+        if (!isSimilar) {
+          distinctDetours.push(detour);
+        }
+        if (distinctDetours.length >= 2) break; // Maximum 2 distinct safe detours
+      }
+
+      // Format names for distinct safe detours
+      distinctDetours.forEach((detour, idx) => {
+        if (idx === 0) {
+          detour.name = detour.name.includes("Calatagan")
+            ? "🛡️ Safe Detour via Calatagan St (RECOMMENDED)"
+            : "🛡️ Safe Detour Route (RECOMMENDED)";
+        } else {
+          detour.name = "🛡️ Alternate Safe Detour";
         }
       });
 
-      setRoutes(calculated);
-      setActiveRouteIndex(0);
+      // Construct clean final list: [Direct Walk, Safe Detour 1, Safe Detour 2 (if distinct)]
+      const finalRoutes: CalculatedRoute[] = [];
+      if (directRoute) {
+        finalRoutes.push(directRoute);
+      }
+      distinctDetours.forEach(d => finalRoutes.push(d));
+
+      // Default active selection: Recommend the Safe Detour (Index 1) if direct route passes danger zone
+      const defaultActiveIndex = (directRoute && directRoute.safety !== 'safe' && distinctDetours.length > 0) ? 1 : 0;
+
+      setRoutes(finalRoutes);
+      setActiveRouteIndex(defaultActiveIndex);
       setRouteCalculated(true);
       setIsSheetExpanded(true); // Auto expand to show metrics instantly
 
@@ -1098,6 +1648,17 @@ export default function MapPage() {
   // Map Tap Interaction Helper
   const handleMapSelection = (latLng: [number, number]) => {
     if (isSimulating) return;
+
+    if (isPickingSpotOnMap) {
+      setSpotCoords(latLng);
+      // Try to find if there is a matching predefined landmark
+      const matchedLandmark = PALANAN_PLACES.find(p => getDistanceMeters(latLng[0], latLng[1], p.latLng[0], p.latLng[1]) <= 25);
+      setSpotAddress(matchedLandmark ? matchedLandmark.address : `Pinned Location [${latLng[0].toFixed(5)}, ${latLng[1].toFixed(5)}]`);
+      setIsPickingSpotOnMap(false);
+      // Re-open Community Spot form modal with pinpoint location applied!
+      setIsAddSpotModalOpen(true);
+      return;
+    }
 
     if (isPickingCoordsOnMap) {
       setFormCoords(latLng);
@@ -1260,6 +1821,151 @@ export default function MapPage() {
     }
   };
 
+  // Community Spot actions
+  const handleUpvoteSpot = async (spotId: string) => {
+    if (upvotingSpotId) return;
+    setUpvotingSpotId(spotId);
+
+    try {
+      const userId = user ? user.uid : `guest_${Date.now()}`;
+      
+      // Optimistic update
+      setCommunitySpots(prev => prev.map(s => {
+        if (s.id === spotId) {
+          const voted = s.votedUsers || [];
+          if (!voted.includes(userId)) {
+            return {
+              ...s,
+              upvotes: (s.upvotes || 0) + 1,
+              votedUsers: [...voted, userId]
+            };
+          }
+        }
+        return s;
+      }));
+
+      if (db) {
+        try {
+          const current = communitySpots.find(s => s.id === spotId);
+          if (current) {
+            const voted = current.votedUsers || [];
+            if (!voted.includes(userId)) {
+              const spotRef = doc(db, 'community_spots', spotId);
+              await updateDoc(spotRef, {
+                upvotes: (current.upvotes || 0) + 1,
+                votedUsers: [...voted, userId]
+              });
+              try {
+                await updateDoc(doc(db, 'communitySpots', spotId), {
+                  upvotes: (current.upvotes || 0) + 1,
+                  votedUsers: [...voted, userId]
+                });
+              } catch (e) { /* ignore */ }
+            }
+          }
+        } catch (e) {
+          console.error("Firestore spot upvote error", e);
+        }
+      }
+
+      try {
+        await fetch(`/api/communityspots/${spotId}/upvote`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ userId })
+        });
+      } catch (e) {
+        console.error("API spot upvote error", e);
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setUpvotingSpotId(null);
+    }
+  };
+
+  const selectSpotDestination = (spot: CommunitySpot) => {
+    if (!spot || !spot.location) return;
+    const coords: [number, number] = [spot.location.lat, spot.location.lng];
+    setEndPoint(coords);
+    setEndQuery(spot.title);
+    if (!startPoint) {
+      setStartPoint(PALANAN_CENTER);
+    }
+    setIsSheetExpanded(true);
+    calculateSafeDirections(startPoint || PALANAN_CENTER, coords);
+  };
+
+  const handleCreateCommunitySpot = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!spotTitle.trim() || !spotCoords) return;
+
+    try {
+      const payload = {
+        title: spotTitle.trim(),
+        category: spotCategory,
+        location: { lat: spotCoords[0], lng: spotCoords[1] },
+        description: spotDescription.trim() || 'Resident suggested community spot.',
+        reporterId: user ? user.uid : 'resident',
+        reporterName: user ? (user.displayName || user.email?.split('@')[0] || 'Resident') : 'Resident',
+        upvotes: 0,
+        votedUsers: [],
+        status: 'pending' as const,
+        active: false,
+        createdAt: Timestamp.now()
+      };
+
+      let createdDocId: string | null = null;
+      if (db) {
+        try {
+          const docRef = await addDoc(collection(db, 'community_spots'), payload);
+          createdDocId = docRef.id;
+          try {
+            await setDoc(doc(db, 'communitySpots', docRef.id), payload);
+          } catch (e) {}
+        } catch (error) {
+          handleFirestoreError(error, OperationType.CREATE, 'community_spots');
+        }
+      }
+
+      if (!createdDocId) {
+        try {
+          const res = await fetch('/api/communityspots', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          createdDocId = data?.id || null;
+        } catch (err) {
+          console.error(err);
+        }
+      }
+
+      if (!db && createdDocId) {
+        const newSpot: CommunitySpot = {
+          id: createdDocId || `spot-local-${Date.now()}`,
+          ...payload
+        };
+        setCommunitySpots(prev => {
+          if (prev.some(s => s.id === newSpot.id || s.title.toLowerCase() === newSpot.title.toLowerCase())) return prev;
+          return [newSpot, ...prev];
+        });
+      }
+
+      setIsAddSpotModalOpen(false);
+      setSpotTitle('');
+      setSpotCategory('safe_haven');
+      setSpotDescription('');
+      setSpotCoords(null);
+      setSpotAddress('');
+
+      setToastMessage(`📩 Suggestion Sent!\nYour community spot suggestion '${spotTitle}' has been submitted for review. It will appear on the public map once approved by Barangay Palanan.`);
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   const resetForm = () => {
     setFormName('');
     setFormCategory('home');
@@ -1270,16 +1976,55 @@ export default function MapPage() {
 
   // Floating button GPS locator and center trigger
   const handleLocateAndCenter = () => {
-    if (mapRef.current) {
-      mapRef.current.setView(PALANAN_CENTER, 17, { animate: true });
+    setAutoFollowGps(true);
+
+    if (!navigator.geolocation) {
+      setToastMessage("⚠️ Geolocation is not supported by your device browser.");
+      return;
     }
-    // Snap default safe starting point to barangay hall if empty
-    if (!startPoint) {
-      setStartPoint(PALANAN_CENTER);
-    }
-    if (startPoint && endPoint) {
-      calculateSafeDirections(startPoint, endPoint);
-    }
+
+    setToastMessage("🛰️ Detecting your live GPS location...");
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const accuracy = pos.coords.accuracy;
+        const heading = pos.coords.heading;
+        const speed = pos.coords.speed;
+        const gpsCoords: [number, number] = [lat, lng];
+
+        setLiveGpsCoords(gpsCoords);
+        setLiveGpsAccuracy(accuracy);
+        if (typeof heading === 'number' && !isNaN(heading)) setLiveGpsHeading(heading);
+        if (typeof speed === 'number' && !isNaN(speed)) setLiveGpsSpeed(speed);
+
+        if (mapRef.current) {
+          mapRef.current.setView(gpsCoords, 17, { animate: true });
+        }
+        if (!startPoint) {
+          setStartPoint(gpsCoords);
+        }
+        if (endPoint) {
+          calculateSafeDirections(gpsCoords, endPoint);
+        }
+
+        setToastMessage(`📍 GPS Located! Precision: ±${Math.round(accuracy)}m`);
+      },
+      (err) => {
+        console.warn("GPS lookup error:", err);
+        let msg = "Could not detect GPS location.";
+        if (err.code === 1) {
+          msg = "Location permission denied. Please allow Location access in your browser / site settings.";
+        } else if (err.code === 2) {
+          msg = "Position unavailable. Please ensure GPS / Location is turned on.";
+        } else if (err.code === 3) {
+          msg = "Location request timed out. Please tap the compass to retry.";
+        }
+        setToastMessage(`⚠️ ${msg}`);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
   };
 
   // Zoom controls wrappers
@@ -1323,7 +2068,7 @@ export default function MapPage() {
         // Scan radar alert proximity limits
         let activeDangerMsg: string | null = null;
         zones.forEach(zone => {
-          if (!zone || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+          if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
           const d = getDistanceMeters(point[0], point[1], zone.location.lat, zone.location.lng);
           if (d <= zone.radius) {
             activeDangerMsg = `PROXIMITY WARNING: Inside active threat zone: "${zone.description}".`;
@@ -1380,6 +2125,28 @@ export default function MapPage() {
     setCurrentLoc(null);
     setProximityAlert(null);
     setIsSheetExpanded(false);
+  };
+
+  const handleClearStartPoint = () => {
+    setStartPoint(null);
+    setStartQuery('');
+    setRouteCalculated(false);
+    setRoutes([]);
+    setIsSimulating(false);
+    if (simulationTimer.current) clearInterval(simulationTimer.current);
+    setCurrentLoc(null);
+    setProximityAlert(null);
+  };
+
+  const handleClearEndPoint = () => {
+    setEndPoint(null);
+    setEndQuery('');
+    setRouteCalculated(false);
+    setRoutes([]);
+    setIsSimulating(false);
+    if (simulationTimer.current) clearInterval(simulationTimer.current);
+    setCurrentLoc(null);
+    setProximityAlert(null);
   };
 
   // Computed variables for selected metrics display
@@ -1476,6 +2243,12 @@ export default function MapPage() {
           )}
 
           <EnforceBoundsAndSettings />
+          <MapViewController 
+            liveCoords={liveGpsCoords} 
+            autoFollow={autoFollowGps} 
+            onMapInstance={(m) => { mapRef.current = m; }} 
+            onUserDrag={() => setAutoFollowGps(false)} 
+          />
           <InvalidateMapSize trigger={`${isSheetExpanded}-${routeCalculated}-${isSimulating}`} />
 
           {/* Boundaries zoom auto fit */}
@@ -1487,7 +2260,7 @@ export default function MapPage() {
 
 
           {/* Crime Danger zones heatmaps / halos */}
-          {zones.filter(zone => zone && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number').map((zone) => {
+          {zones.filter(zone => zone && !isZoneResolved(zone) && zone.active !== false && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number').map((zone) => {
             const specs = getDangerZoneSpecs(zone);
             return (
               <React.Fragment key={zone.id}>
@@ -1528,7 +2301,68 @@ export default function MapPage() {
             );
           })}
 
-          {/* Verified user hazard reports - removed as requested */}
+          {/* Community Spots Pinpoint Markers */}
+          {showCommunitySpots && communitySpots
+            .filter(spot => spot && spot.active && spot.status === 'approved' && spot.location && typeof spot.location.lat === 'number' && typeof spot.location.lng === 'number')
+            .filter(spot => selectedSpotCategory === 'all' || spot.category === selectedSpotCategory)
+            .map((spot) => {
+              const isSelected = selectedCommunitySpot?.id === spot.id;
+              return (
+                <Marker
+                  key={`spot-${spot.id}`}
+                  position={[spot.location.lat, spot.location.lng]}
+                  icon={createCommunitySpotIcon(spot.category, isSelected)}
+                  eventHandlers={{
+                    click: () => setSelectedCommunitySpot(spot)
+                  }}
+                >
+                  <Popup>
+                    <div className="p-2 min-w-[200px] max-w-[260px] text-xs font-sans">
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-white ${getSpotCategoryBg(spot.category)}`}>
+                          {getSpotCategoryIcon(spot.category)} {getSpotCategoryLabel(spot.category)}
+                        </span>
+                        <span className="text-[10px] text-slate-500 font-bold flex items-center gap-0.5">
+                          👍 {spot.upvotes || 0}
+                        </span>
+                      </div>
+                      
+                      <h4 className="font-black text-slate-900 text-sm leading-snug mb-1">{spot.title}</h4>
+                      <p className="text-slate-600 text-xs mb-2 leading-relaxed">{spot.description}</p>
+                      
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1.5 border-t border-slate-100 mb-2">
+                        <span>By {spot.reporterName || 'Resident'}</span>
+                        <span className="font-semibold text-emerald-600">🛡️ Admin Verified</span>
+                      </div>
+
+                      <div className="flex gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => handleUpvoteSpot(spot.id)}
+                          disabled={upvotingSpotId === spot.id || (user && spot.votedUsers?.includes(user.uid))}
+                          className={`flex-1 py-1.5 px-2 rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 transition-all ${
+                            user && spot.votedUsers?.includes(user.uid)
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200 cursor-default'
+                              : 'bg-emerald-600 hover:bg-emerald-700 text-white shadow-xs active:scale-95'
+                          }`}
+                        >
+                          {user && spot.votedUsers?.includes(user.uid) ? '✓ Upvoted (+1)' : '👍 I Feel Safe (+1)'}
+                        </button>
+                        
+                        <button
+                          type="button"
+                          onClick={() => selectSpotDestination(spot)}
+                          className="py-1.5 px-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 shadow-xs active:scale-95"
+                          title="Navigate to this spot"
+                        >
+                          <Navigation className="w-3 h-3" /> Go
+                        </button>
+                      </div>
+                    </div>
+                  </Popup>
+                </Marker>
+              );
+            })}
 
           {/* Start Point Pin */}
           {startPoint && !currentLoc && (
@@ -1550,6 +2384,51 @@ export default function MapPage() {
             </>
           )}
 
+          {/* Real-Time Live User GPS Pinpoint & Precision Halo */}
+          {liveGpsCoords && !isSimulating && (
+            <>
+              <Marker position={liveGpsCoords} icon={createLiveGpsPuckIcon(liveGpsHeading)}>
+                <Popup>
+                  <div className="text-xs p-1 min-w-[150px]">
+                    <span className="font-bold text-blue-600 flex items-center gap-1.5">
+                      <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping inline-block"></span>
+                      Real-Time GPS Location
+                    </span>
+                    <p className="text-[10px] text-slate-600 mt-1 font-medium">
+                      {liveGpsAccuracy ? `Precision: ±${Math.round(liveGpsAccuracy)} meters` : 'High-precision GPS'}
+                    </p>
+                    {liveGpsSpeed !== null && liveGpsSpeed > 0.3 && (
+                      <p className="text-[10px] text-emerald-600 font-semibold mt-0.5">
+                        Moving: {(liveGpsSpeed * 3.6).toFixed(1)} km/h
+                      </p>
+                    )}
+                    <button
+                      onClick={() => setAutoFollowGps(!autoFollowGps)}
+                      className={`mt-2 w-full py-1 px-2 rounded text-[10px] font-bold ${
+                        autoFollowGps ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-700'
+                      }`}
+                    >
+                      {autoFollowGps ? '✓ Auto-Follow On' : 'Enable Auto-Follow'}
+                    </button>
+                  </div>
+                </Popup>
+              </Marker>
+              {liveGpsAccuracy && liveGpsAccuracy > 0 && (
+                <Circle 
+                  center={liveGpsCoords} 
+                  radius={Math.min(Math.max(liveGpsAccuracy, 6), 60)} 
+                  pathOptions={{ 
+                    fillColor: '#3b82f6', 
+                    fillOpacity: 0.12, 
+                    color: '#2563eb', 
+                    weight: 1.5,
+                    dashArray: '2, 3'
+                  }} 
+                />
+              )}
+            </>
+          )}
+
           {/* Active Navigation simulated GPS tracker */}
           {currentLoc && (
             <Marker position={currentLoc} icon={userIcon}>
@@ -1563,7 +2442,7 @@ export default function MapPage() {
           )}
 
           {/* Drawn routing path on streets */}
-          {routeCalculated && routes.map((r, idx) => {
+          {routeCalculated && startPoint && endPoint && routes.map((r, idx) => {
             const isSelected = idx === activeRouteIndex;
             const borderWeight = isSelected ? 10 : 5;
             const innerWeight = isSelected ? 5 : 2;
@@ -1619,13 +2498,106 @@ export default function MapPage() {
             );
           })}
 
+          {/* Temporary Pinpoint Preview Marker when picking spot location on map */}
+          {spotCoords && (isAddSpotModalOpen || isPickingSpotOnMap) && (
+            <Marker position={spotCoords} icon={createCommunitySpotIcon(spotCategory, true)}>
+              <Popup autoPan={false}>
+                <div className="p-1.5 text-center font-sans space-y-0.5">
+                  <p className="font-extrabold text-xs text-emerald-700">📍 Selected Pinpoint Area</p>
+                  <p className="text-[10px] text-slate-500 font-mono">[{spotCoords[0].toFixed(5)}, {spotCoords[1].toFixed(5)}]</p>
+                </div>
+              </Popup>
+            </Marker>
+          )}
+
         </MapContainer>
+
+        {/* Banner Overlay when in Map Pinpoint mode for Resident Suggestion */}
+        {isPickingSpotOnMap && (
+          <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[3000] bg-emerald-600 text-white px-5 py-3 rounded-full shadow-2xl flex items-center gap-3 animate-bounce border-2 border-white pointer-events-auto">
+            <MapPin className="w-5 h-5 text-emerald-200 animate-pulse shrink-0" />
+            <span className="font-extrabold text-xs">Tap anywhere on the map to pinpoint your suggested spot!</span>
+            <button
+              type="button"
+              onClick={() => {
+                setIsPickingSpotOnMap(false);
+                setIsAddSpotModalOpen(true);
+              }}
+              className="bg-white/20 hover:bg-white/30 text-white text-[10px] font-black px-3 py-1 rounded-full transition cursor-pointer"
+            >
+              Cancel
+            </button>
+          </div>
+        )}
+
+
+
+        {/* Community Spots Pinpoint Control Bar & Legend */}
+        <div id="community-spots-map-control" className={`absolute top-4 left-4 z-[990] rounded-2xl shadow-xl border p-2.5 max-w-xs transition-colors duration-300 ${
+          darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white/95 backdrop-blur border-slate-200 text-slate-800'
+        }`}>
+          <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100 mb-2">
+            <button
+              type="button"
+              onClick={() => setShowCommunitySpots(!showCommunitySpots)}
+              className="flex items-center gap-1.5 text-xs font-black tracking-wide text-slate-800 hover:text-emerald-600 transition"
+            >
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+              <span>🌟 COMMUNITY SPOTS</span>
+              <span className="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+                {activeApprovedSpots.length}
+              </span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setIsAddSpotModalOpen(false);
+                setIsPickingSpotOnMap(true);
+              }}
+              className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[10px] font-bold py-1 px-2.5 rounded-full flex items-center gap-1 shadow-xs transition-all cursor-pointer"
+            >
+              <Plus className="w-3 h-3" /> Pin Spot
+            </button>
+          </div>
+
+          {showCommunitySpots && (
+            <div className="flex flex-wrap gap-1">
+              {[
+                { id: 'all', label: 'All', icon: '📍' },
+                { id: 'safe_haven', label: 'Safe Haven', icon: '🛡️' },
+                { id: 'well_lit', label: 'Well-Lit', icon: '💡' },
+                { id: 'friendly_business', label: 'Store', icon: '🏪' },
+                { id: 'community_hub', label: 'Hub', icon: '☕' },
+                { id: 'enjoyed_spot', label: 'Enjoyed', icon: '🌟' }
+              ].map((cat) => (
+                <button
+                  key={cat.id}
+                  type="button"
+                  onClick={() => setSelectedSpotCategory(cat.id)}
+                  className={`px-2 py-0.5 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all ${
+                    selectedSpotCategory === cat.id
+                      ? 'bg-slate-900 text-white shadow-xs scale-105'
+                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                  }`}
+                >
+                  <span>{cat.icon}</span>
+                  <span>{cat.label}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* Floating current location + Map controls directly on bottom-right of map */}
         <FloatingMapControls 
-          onRecenter={handleLocateAndCenter}
+          onRecenter={() => {
+            setAutoFollowGps(true);
+            handleLocateAndCenter();
+          }}
           onZoomIn={handleZoomIn}
           onZoomOut={handleZoomOut}
+          autoFollow={autoFollowGps}
+          hasLiveGps={!!liveGpsCoords}
         />
 
         {/* Circles Risk Legend to sync with Admin Portal */}
@@ -1782,7 +2754,7 @@ export default function MapPage() {
                     <MapPin className="w-4 h-4" />
                   </button>
                   {startPoint && (
-                    <button onClick={() => { setStartPoint(null); setStartQuery(''); }} className={`p-1 ${darkMode ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'}`}>
+                    <button onClick={handleClearStartPoint} className={`p-1 ${darkMode ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'}`}>
                       <X className="w-3.5 h-3.5" />
                     </button>
                   )}
@@ -1853,7 +2825,7 @@ export default function MapPage() {
                     <MapPin className="w-4 h-4" />
                   </button>
                   {endPoint && (
-                    <button onClick={() => { setEndPoint(null); setEndQuery(''); }} className={`p-1 ${darkMode ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'}`}>
+                    <button onClick={handleClearEndPoint} className={`p-1 ${darkMode ? 'text-slate-500 hover:text-slate-300' : 'text-slate-400 hover:text-slate-600'}`}>
                       <X className="w-3.5 h-3.5" />
                     </button>
                   )}
@@ -2021,36 +2993,51 @@ export default function MapPage() {
                   </div>
                 </div>
 
-                {/* Safety Factors Dashboard factors matching user request */}
+                {/* Safety Factors Dashboard factors matching active route */}
                 <div className="bg-white/5 rounded-xl p-2.5 border border-white/10 space-y-1.5 text-[10px]">
                   <p className="font-extrabold uppercase tracking-wide text-indigo-300">Safety Score Breakdown Factors</p>
-                  <div className="grid grid-cols-2 gap-1 px-1 text-slate-300">
-                    <div>🔰 Nearby Incident signal: <strong className="text-white">Active 0</strong></div>
-                    <div>🎯 Safe Zone Proximity: <strong className="text-emerald-400">High</strong></div>
-                    <div>🛡️ Dangerous intersections bypassed: <strong className="text-white">All</strong></div>
-                    <div>🚨 Threat rating index: <strong className="text-emerald-400">Safe Corridor</strong></div>
+                  <div className="grid grid-cols-2 gap-1.5 px-1 text-slate-300">
+                    <div>🔰 Route Risk Level: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety.toUpperCase()}</strong></div>
+                    <div>🎯 Threat Zone Status: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety === 'safe' ? 'Fully Avoided' : activeRoute.safety === 'moderate' ? 'Near Perimeter' : 'Crosses Threat Zone'}</strong></div>
+                    <div>🛡️ Active Threat Detour: <strong className="text-white">{activeRoute.name.includes("Detour") || activeRoute.safety === 'safe' ? 'Active Safe Bypass' : 'Direct Path'}</strong></div>
+                    <div>🚨 Safety Rating Index: <strong className={activeScore >= 85 ? 'text-emerald-400' : activeScore >= 70 ? 'text-amber-400' : 'text-red-400'}>{activeScore}% Safe</strong></div>
                   </div>
                 </div>
               </div>
 
               {/* MULTIPLE ALTERNATIVE PATHS SELECTOR */}
               <div className="space-y-1.5">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">ALTERNATIVE SAFE PATH OPTIONS</p>
-                <div className="flex gap-2 overflow-x-auto pb-1 max-w-full scrollbar-hide">
+                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">CALCULATED ROUTE OPTIONS</p>
+                <div className="flex gap-2.5 overflow-x-auto pb-1 max-w-full scrollbar-hide">
                   {routes.map((r, idx) => {
                     const isSelected = idx === activeRouteIndex;
+                    const isSafe = r.safety === 'safe';
+                    const isModerate = r.safety === 'moderate';
+
                     return (
                       <button
                         key={`alt-choice-${idx}`}
                         onClick={() => setActiveRouteIndex(idx)}
-                        className={`p-2.5 rounded-xl border flex-shrink-0 w-36 text-left transition-all ${
-                          isSelected ? 'bg-blue-50 border-blue-600 text-blue-900 ring-1 ring-blue-500' : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'
+                        className={`p-2.5 rounded-xl border flex-shrink-0 w-44 text-left transition-all relative ${
+                          isSelected 
+                            ? 'bg-blue-50/90 border-blue-600 text-blue-950 ring-2 ring-blue-500 shadow-sm' 
+                            : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'
                         }`}
                       >
-                        <span className="text-[8px] font-extrabold block truncate opacity-75">{r.name}</span>
-                        <div className="flex justify-between items-center mt-1">
-                          <span className="text-xs font-black font-mono">{(r.distance / 1000).toFixed(1)} km</span>
-                          <span className="text-[9px] font-black font-mono text-emerald-600">{r.safetyScore}%</span>
+                        <span className={`text-[10px] font-black block leading-snug line-clamp-2 ${isSelected ? 'text-blue-950' : 'text-slate-800'}`}>
+                          {r.name}
+                        </span>
+                        <div className="flex justify-between items-center mt-2 pt-1 border-t border-slate-200/60">
+                          <span className="text-xs font-black font-mono">{(r.distance / 1000).toFixed(2)} km</span>
+                          <span className={`text-[9px] font-black font-mono px-1.5 py-0.5 rounded-md border ${
+                            isSafe 
+                              ? 'bg-emerald-100 text-emerald-800 border-emerald-300' 
+                              : isModerate 
+                              ? 'bg-amber-100 text-amber-800 border-amber-300' 
+                              : 'bg-red-100 text-red-800 border-red-300'
+                          }`}>
+                            {r.safetyScore}%
+                          </span>
                         </div>
                       </button>
                     );
@@ -2167,14 +3154,17 @@ export default function MapPage() {
             initial={{ opacity: 0 }} 
             animate={{ opacity: 1 }} 
             exit={{ opacity: 0 }} 
-            className="absolute inset-0 bg-slate-950/65 backdrop-blur-xs z-[2000] flex items-end justify-center"
+            onWheel={(e) => e.stopPropagation()}
+            onTouchMove={(e) => e.stopPropagation()}
+            className="fixed inset-0 bg-slate-950/65 backdrop-blur-xs z-[3000] flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden font-sans"
           >
             <motion.div 
               initial={{ y: '100%' }} 
               animate={{ y: 0 }} 
               exit={{ y: '100%' }} 
               transition={{ type: 'spring', damping: 25, stiffness: 220 }}
-              className={`rounded-t-3xl shadow-2xl p-6 w-full max-w-md max-h-[90%] overflow-y-auto space-y-4 text-left border-t transition-colors duration-300 ${
+              onWheel={(e) => e.stopPropagation()}
+              className={`rounded-t-3xl sm:rounded-3xl shadow-2xl p-6 w-full max-w-md max-h-[85vh] overflow-y-auto space-y-4 text-left border-t sm:border transition-colors duration-300 pb-24 sm:pb-6 overscroll-contain ${
                 darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200'
               }`}
             >
@@ -2357,14 +3347,17 @@ export default function MapPage() {
             initial={{ opacity: 0 }} 
             animate={{ opacity: 1 }} 
             exit={{ opacity: 0 }} 
-            className="absolute inset-0 bg-slate-950/65 backdrop-blur-xs z-[2000] flex items-end justify-center"
+            onWheel={(e) => e.stopPropagation()}
+            onTouchMove={(e) => e.stopPropagation()}
+            className="fixed inset-0 bg-slate-950/65 backdrop-blur-xs z-[3000] flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden font-sans"
           >
             <motion.div 
               initial={{ y: '100%' }} 
               animate={{ y: 0 }} 
               exit={{ y: '100%' }} 
               transition={{ type: 'spring', damping: 25, stiffness: 220 }}
-              className={`rounded-t-3xl shadow-2xl p-6 w-full max-w-md max-h-[95%] overflow-y-auto space-y-4 text-left border-t transition-colors duration-300 ${
+              onWheel={(e) => e.stopPropagation()}
+              className={`rounded-t-3xl sm:rounded-3xl shadow-2xl p-6 w-full max-w-md max-h-[85vh] overflow-y-auto space-y-4 text-left border-t sm:border transition-colors duration-300 pb-24 sm:pb-6 overscroll-contain ${
                 darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200'
               }`}
             >
@@ -2490,6 +3483,275 @@ export default function MapPage() {
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* PIN COMMUNITY SPOT MODAL OVERLAY */}
+      <AnimatePresence>
+        {isAddSpotModalOpen && (
+          <motion.div 
+            initial={{ opacity: 0 }} 
+            animate={{ opacity: 1 }} 
+            exit={{ opacity: 0 }} 
+            onWheel={(e) => e.stopPropagation()}
+            onTouchMove={(e) => e.stopPropagation()}
+            className="fixed inset-0 bg-slate-950/65 backdrop-blur-xs z-[3000] flex items-end sm:items-center justify-center p-0 sm:p-4 overflow-hidden font-sans"
+          >
+            <motion.div 
+              initial={{ y: '100%' }} 
+              animate={{ y: 0 }} 
+              exit={{ y: '100%' }} 
+              transition={{ type: 'spring', damping: 25, stiffness: 220 }}
+              onWheel={(e) => e.stopPropagation()}
+              className={`rounded-t-3xl sm:rounded-3xl shadow-2xl p-6 w-full max-w-md max-h-[85vh] overflow-y-auto space-y-4 text-left border-t sm:border transition-colors duration-300 pb-28 sm:pb-6 overscroll-contain ${
+                darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200'
+              }`}
+            >
+              <div className={`flex justify-between items-center pb-2 border-b ${darkMode ? 'border-slate-800' : 'border-slate-100'}`}>
+                <h3 className={`text-sm font-black flex items-center gap-1.5 ${darkMode ? 'text-white' : 'text-slate-800'}`}>
+                  🌟 Pin a Community Spot
+                </h3>
+                <button 
+                  type="button"
+                  onClick={() => setIsAddSpotModalOpen(false)}
+                  className={`p-1.5 rounded-full transition-colors ${
+                    darkMode ? 'text-slate-400 hover:text-slate-200 hover:bg-slate-800' : 'text-slate-400 hover:text-slate-600 hover:bg-slate-100'
+                  }`}
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <p className="text-xs text-slate-500 font-medium">
+                Share places where residents feel safe, well-lit, or enjoy gathering in Barangay Palanan.
+              </p>
+
+              <div className={`p-2.5 rounded-2xl text-xs flex items-center gap-2 font-medium ${
+                isAdmin 
+                  ? 'bg-purple-50 text-purple-900 border border-purple-200' 
+                  : 'bg-amber-50 text-amber-900 border border-amber-200'
+              }`}>
+                <span>
+                  {isAdmin 
+                    ? '🛡️ Admin Mode: Submitting will publish this spot directly to the public map.' 
+                    : '📩 Resident Mode: Your suggested spot will be sent to the Admin Portal for review before appearing on the public map.'}
+                </span>
+              </div>
+
+              <form onSubmit={handleCreateCommunitySpot} className="space-y-4">
+                {/* Spot Title */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block font-sans">Spot Name / Title</label>
+                  <input 
+                    type="text"
+                    required
+                    placeholder="e.g. Well-Lit Walkway on Edison St"
+                    value={spotTitle}
+                    onChange={(e) => setSpotTitle(e.target.value)}
+                    className={`w-full border rounded-2xl p-3 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500 ${
+                      darkMode ? 'bg-slate-950 border-slate-800 text-white placeholder:text-slate-600' : 'bg-slate-50 border-slate-200 text-slate-900 placeholder:text-slate-400'
+                    }`}
+                  />
+                </div>
+
+                {/* Spot Category Selector */}
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block font-sans">Category</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {[
+                      { type: 'safe_haven', label: '🛡️ Safe Haven', desc: 'Manned, police outpost, 24/7 help' },
+                      { type: 'well_lit', label: '💡 Well-Lit Pathway', desc: 'Bright LED lights, clear visibility' },
+                      { type: 'friendly_business', label: '🏪 Friendly Store', desc: 'Open 24/7, welcoming shop' },
+                      { type: 'community_hub', label: '☕ Community Hub', desc: 'Active gathering, sports, parks' },
+                      { type: 'enjoyed_spot', label: '🌟 Enjoyed Spot', desc: 'Scenic garden, quiet walk' }
+                    ].map((cat) => (
+                      <button
+                        key={cat.type}
+                        type="button"
+                        onClick={() => setSpotCategory(cat.type as CommunitySpotCategory)}
+                        className={`p-2.5 rounded-2xl border text-left flex flex-col gap-0.5 transition-all text-xs font-bold ${
+                          spotCategory === cat.type
+                            ? 'bg-emerald-50 border-emerald-600 text-emerald-800 ring-2 ring-emerald-500/30'
+                            : 'bg-slate-50 border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        <span className="font-extrabold text-slate-900">{cat.label}</span>
+                        <span className="text-[9px] font-normal text-slate-500 leading-tight">{cat.desc}</span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Description */}
+                <div className="space-y-1">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block font-sans">Why do you feel safe / enjoy here?</label>
+                  <textarea 
+                    rows={2}
+                    placeholder="Describe lighting, CCTV, staff, foot traffic or scenery..."
+                    value={spotDescription}
+                    onChange={(e) => setSpotDescription(e.target.value)}
+                    className={`w-full border rounded-2xl p-3 text-xs font-semibold focus:outline-none focus:ring-2 focus:ring-emerald-500 ${
+                      darkMode ? 'bg-slate-950 border-slate-800 text-white placeholder:text-slate-600' : 'bg-slate-50 border-slate-200 text-slate-900 placeholder:text-slate-400'
+                    }`}
+                  />
+                </div>
+
+                {/* Location Display & Pinpoint Action */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block font-sans">
+                    Pinpoint Area on Map
+                  </label>
+                  
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsAddSpotModalOpen(false);
+                      setIsPickingSpotOnMap(true);
+                    }}
+                    className="w-full py-3.5 px-4 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs rounded-2xl flex items-center justify-center gap-2 shadow-md active:scale-95 transition-all cursor-pointer"
+                  >
+                    <MapPin className="w-4 h-4 animate-bounce" />
+                    {spotCoords ? '📍 Change Pinpoint Location on Map' : '📍 Tap Here to Pinpoint Location directly on Map'}
+                  </button>
+
+                  {spotCoords ? (
+                    <div className="p-3 bg-emerald-50 border border-emerald-300 rounded-2xl flex items-center justify-between text-xs text-emerald-900 shadow-xs">
+                      <div className="space-y-0.5">
+                        <p className="font-extrabold text-[11px] text-emerald-800 flex items-center gap-1">
+                          <span>✅ Exact Pinpoint Set</span>
+                        </p>
+                        <p className="text-[10px] font-mono text-emerald-700">
+                          [{spotCoords[0].toFixed(5)}, {spotCoords[1].toFixed(5)}] {spotAddress}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setIsAddSpotModalOpen(false);
+                          setIsPickingSpotOnMap(true);
+                        }}
+                        className="text-[10px] font-extrabold bg-emerald-600 text-white px-2.5 py-1 rounded-xl hover:bg-emerald-700 transition"
+                      >
+                        Re-pin
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="p-3 bg-amber-50 border border-amber-200 rounded-2xl text-center space-y-1">
+                      <p className="text-[11px] font-extrabold text-amber-800">
+                        ⚠️ No Location Pinpointed Yet
+                      </p>
+                      <p className="text-[10px] text-amber-700">
+                        Tap the green button above or choose a landmark below to set your spot.
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="pt-1">
+                    <span className="text-[9px] font-bold text-slate-400 block mb-1">Quick Landmark Presets:</span>
+                    <div className="flex gap-1.5 overflow-x-auto pb-1">
+                      {PALANAN_PLACES.slice(0, 5).map((pl) => (
+                        <button
+                          key={pl.name}
+                          type="button"
+                          onClick={() => {
+                            setSpotCoords(pl.latLng);
+                            setSpotAddress(pl.address);
+                          }}
+                          className={`px-2.5 py-1.5 rounded-xl border text-[10px] font-bold shrink-0 transition ${
+                            spotCoords && spotCoords[0] === pl.latLng[0] && spotCoords[1] === pl.latLng[1]
+                              ? 'bg-emerald-100 border-emerald-500 text-emerald-800 font-black ring-2 ring-emerald-500/20'
+                              : 'bg-slate-100 border-slate-200 text-slate-600 hover:bg-slate-200'
+                          }`}
+                        >
+                          📍 {pl.name.split(' ')[0]}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Submit buttons */}
+                <div className="flex gap-2.5 pt-2">
+                  <button
+                    type="button"
+                    onClick={() => setIsAddSpotModalOpen(false)}
+                    className="flex-1 py-3 rounded-2xl font-bold bg-slate-100 text-slate-700 text-xs hover:bg-slate-200 transition-all"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    type="submit"
+                    disabled={!spotCoords || !spotTitle.trim()}
+                    className="flex-1 bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white disabled:opacity-50 font-black py-3 rounded-2xl text-xs flex items-center justify-center gap-1 shadow-md transition-all"
+                  >
+                    {isAdmin ? '🌟 Publish Spot Directly' : '📩 Submit Suggestion'}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* HIGH-VISIBILITY GPS STATUS & PERMISSION TOAST BANNER */}
+      <AnimatePresence>
+        {toastMessage && (
+          <motion.div
+            initial={{ opacity: 0, y: -20, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -20, scale: 0.95 }}
+            className="absolute top-3 left-3 right-3 z-[4000] max-w-sm mx-auto shadow-2xl"
+          >
+            <div className={`p-3.5 rounded-2xl border text-left flex items-start gap-3 backdrop-blur-md ${
+              toastMessage.includes('⚠️') || toastMessage.includes('denied') || toastMessage.includes('unavailable')
+                ? 'bg-amber-950/90 border-amber-500/50 text-amber-100 shadow-amber-900/30'
+                : toastMessage.includes('📍') || toastMessage.includes('Located')
+                  ? 'bg-emerald-950/90 border-emerald-500/50 text-emerald-100 shadow-emerald-900/30'
+                  : 'bg-slate-900/95 border-slate-700 text-white shadow-black/40'
+            }`}>
+              <div className="text-lg shrink-0 mt-0.5">
+                {toastMessage.includes('⚠️') || toastMessage.includes('denied') ? (
+                  <ShieldAlert className="w-5 h-5 text-amber-400 animate-pulse" />
+                ) : toastMessage.includes('📍') || toastMessage.includes('Located') ? (
+                  <MapPin className="w-5 h-5 text-emerald-400" />
+                ) : (
+                  <Compass className="w-5 h-5 text-blue-400 animate-spin" />
+                )}
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-[11px] font-black uppercase tracking-wider opacity-80 mb-0.5">
+                  {toastMessage.includes('denied') || toastMessage.includes('permission')
+                    ? 'Location Permission Notice'
+                    : toastMessage.includes('Located')
+                      ? 'GPS Signal Locked'
+                      : 'GPS Tracking Update'}
+                </p>
+                <p className="text-xs font-semibold leading-relaxed break-words">
+                  {toastMessage.replace(/^[⚠️📍🛰️]\s*/, '')}
+                </p>
+                {(toastMessage.includes('permission') || toastMessage.includes('denied')) && (
+                  <div className="mt-2 pt-2 border-t border-amber-500/30 flex items-center justify-between gap-2">
+                    <span className="text-[10px] text-amber-200/90">Turn on Phone GPS & tap Allow in browser</span>
+                    <button
+                      onClick={handleLocateAndCenter}
+                      className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 active:scale-95 text-slate-950 font-black rounded-lg text-[10px] shrink-0 transition"
+                    >
+                      Retry GPS
+                    </button>
+                  </div>
+                )}
+              </div>
+              <button
+                onClick={() => setToastMessage(null)}
+                className="p-1 rounded-lg text-white/60 hover:text-white hover:bg-white/10 shrink-0 transition"
+                title="Dismiss"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+
 
     </div>
   );

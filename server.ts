@@ -26,8 +26,9 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  // Middleware
-  app.use(express.json());
+  // Middleware - Support larger payloads for hazard photo attachments & batch syncs
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
   // Load Firebase Application credentials from firebase-applet-config.json
   const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
@@ -61,28 +62,48 @@ async function startServer() {
   // SERVER-SIDE SYNC API: Resident Synchronization across all central collections
   app.post('/api/sync-resident', async (req, res) => {
     try {
-      const { uid, name, email } = req.body;
-      if (!uid || !email) {
-        return res.status(400).json({ error: 'Missing uid or email fields.' });
+      const { uid, name, email, phoneNumber, phone, mobileNumber, authMethod, authProvider } = req.body;
+      const cleanPhone = (phoneNumber || phone || mobileNumber || '').trim();
+      const isPhone = authMethod === 'phone' || authProvider === 'phone' || !!cleanPhone || (email && (email.includes('@phone.') || email.endsWith('.saferoute.ph')));
+      const resolvedAuthMethod = authMethod || (isPhone ? 'phone' : (email ? 'email' : 'phone'));
+      const cleanEmail = email || (cleanPhone ? `${cleanPhone.replace(/[^0-9]/g, '')}@phone.saferoute.ph` : '');
+
+      if (!uid) {
+        return res.status(400).json({ error: 'Missing uid field.' });
       }
 
       if (db) {
-        const payload = {
+        const payload: any = {
           uid,
-          name,
-          email,
+          name: name || (cleanPhone ? `Resident (${cleanPhone})` : 'Anonymous Resident'),
+          email: cleanEmail,
           role: 'resident',
           status: 'active',
+          authMethod: resolvedAuthMethod,
+          authProvider: resolvedAuthMethod,
+          provider: resolvedAuthMethod,
+          authType: resolvedAuthMethod,
+          isPhoneAuth: resolvedAuthMethod === 'phone',
           createdAt: Timestamp.now(),
           updatedAt: Timestamp.now()
         };
+
+        if (isPhone) {
+          payload.phoneBridgeEmail = cleanEmail;
+        }
+
+        if (cleanPhone) {
+          payload.phoneNumber = cleanPhone;
+          payload.phone = cleanPhone;
+          payload.mobileNumber = cleanPhone;
+        }
 
         const collections = ['users', 'residents', 'registeredUsers', 'accounts'];
         const results = [];
 
         for (const collName of collections) {
           try {
-            await setDoc(doc(db, collName, uid), payload);
+            await setDoc(doc(db, collName, uid), payload, { merge: true });
             results.push({ collection: collName, status: 'synced' });
           } catch (e: any) {
             console.error(`Backend sync failed for ${collName}/${uid}:`, e.message);
@@ -139,19 +160,39 @@ async function startServer() {
   // AUTH API: Register Profile
   app.post('/api/register', async (req, res) => {
     try {
-      const { uid, name, email, role } = req.body;
-      if (!uid || !email) {
-        return res.status(400).json({ error: 'Missing uid or email fields.' });
+      const { uid, name, email, phoneNumber, phone, role, authMethod } = req.body;
+      if (!uid) {
+        return res.status(400).json({ error: 'Missing uid field.' });
       }
+
+      const cleanPhone = (phoneNumber || phone || '').trim();
+      const isPhone = authMethod === 'phone' || !!cleanPhone || (email && (email.includes('@phone.') || email.endsWith('.saferoute.ph')));
+      const resolvedAuthMethod = authMethod || (isPhone ? 'phone' : (email ? 'email' : 'phone'));
+      const cleanEmail = email || (cleanPhone ? `${cleanPhone.replace(/[^0-9]/g, '')}@phone.saferoute.ph` : '');
 
       if (db) {
         // Persist User Profile directly in Firestore
-        await setDoc(doc(db, 'users', uid), {
-          name: name || 'Anonymous User',
-          email,
+        const userDocData: any = {
+          name: name || (cleanPhone ? `Resident (${cleanPhone})` : 'Anonymous User'),
+          email: cleanEmail,
           role: role || 'resident',
+          authMethod: resolvedAuthMethod,
+          authProvider: resolvedAuthMethod,
+          provider: resolvedAuthMethod,
+          authType: resolvedAuthMethod,
+          isPhoneAuth: resolvedAuthMethod === 'phone',
           createdAt: Timestamp.now()
-        });
+        };
+        if (isPhone) {
+          userDocData.phoneBridgeEmail = cleanEmail;
+        }
+        if (cleanPhone) {
+          userDocData.phoneNumber = cleanPhone;
+          userDocData.phone = cleanPhone;
+          userDocData.mobileNumber = cleanPhone;
+        }
+
+        await setDoc(doc(db, 'users', uid), userDocData, { merge: true });
         return res.json({ message: 'User registered successfully inside Firestore.', uid });
       } else {
         return res.json({ message: 'User registered (Mock Mode)', uid });
@@ -164,8 +205,110 @@ async function startServer() {
   // AUTH API: Login Profile (Auxiliary logger endpoint)
   app.post('/api/login', async (req, res) => {
     try {
-      const { email } = req.body;
-      res.json({ message: 'Login event tracked successfully on API endpoint.', email });
+      const { email, phoneNumber } = req.body;
+      res.json({ message: 'Login event tracked successfully on API endpoint.', email, phoneNumber });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // AUTH API: Lookup Resident by Phone or Email
+  app.post('/api/lookup-resident', async (req, res) => {
+    try {
+      const { identifier } = req.body; // Can be email or phone number
+      if (!identifier) {
+        return res.status(400).json({ error: 'Missing identifier parameter' });
+      }
+
+      if (db) {
+        const cleanIdent = identifier.trim();
+        const cleanDigits = cleanIdent.replace(/[^0-9]/g, '');
+
+        // Query across users and residents collection
+        const colls = ['users', 'residents'];
+        for (const coll of colls) {
+          const snap = await getDocs(collection(db, coll));
+          for (const docSnap of snap.docs) {
+            const data = docSnap.data();
+            const docEmail = (data.email || '').toLowerCase();
+            const docPhone = (data.phoneNumber || data.phone || data.mobileNumber || '').replace(/[^0-9]/g, '');
+
+            if (
+              (docEmail && docEmail === cleanIdent.toLowerCase()) ||
+              (cleanDigits.length >= 7 && docPhone && docPhone.includes(cleanDigits)) ||
+              (cleanDigits.length >= 7 && docEmail && docEmail.includes(cleanDigits))
+            ) {
+              return res.json({
+                found: true,
+                uid: docSnap.id,
+                name: data.name || 'Resident',
+                email: data.email || `${cleanDigits}@phone.saferoute.ph`,
+                phoneNumber: data.phoneNumber || data.phone || cleanIdent,
+                role: data.role || 'resident',
+                createdAt: data.createdAt
+              });
+            }
+          }
+        }
+      }
+
+      return res.json({ found: false });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // AUTH API: Delete User Account
+  app.post('/api/delete-account', async (req, res) => {
+    try {
+      const { uid, email } = req.body;
+      if (!uid && !email) {
+        return res.status(400).json({ error: 'Missing uid or email for account deletion.' });
+      }
+
+      if (db) {
+        const collections = ['users', 'residents', 'registeredUsers', 'accounts'];
+        const deletionResults = [];
+        for (const collName of collections) {
+          try {
+            if (uid) {
+              await deleteDoc(doc(db, collName, uid));
+              deletionResults.push({ collection: collName, status: 'deleted' });
+            }
+          } catch (e: any) {
+            deletionResults.push({ collection: collName, status: 'failed', error: e.message });
+          }
+        }
+        return res.json({ success: true, message: 'User account records removed from database.', results: deletionResults });
+      } else {
+        return res.json({ success: true, message: 'User account removed (Sandbox Mode)' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // AUTH API: Save Privacy Settings
+  app.post('/api/user-privacy', async (req, res) => {
+    try {
+      const { uid, privacySettings } = req.body;
+      if (!uid) {
+        return res.status(400).json({ error: 'Missing uid.' });
+      }
+      if (db) {
+        await updateDoc(doc(db, 'users', uid), {
+          privacySettings,
+          updatedAt: Timestamp.now()
+        }).catch(async () => {
+          await setDoc(doc(db, 'users', uid), {
+            privacySettings,
+            updatedAt: Timestamp.now()
+          }, { merge: true });
+        });
+        return res.json({ success: true, message: 'Privacy settings saved to cloud.' });
+      } else {
+        return res.json({ success: true, message: 'Privacy settings saved (Sandbox Mode)' });
+      }
     } catch (err: any) {
       res.status(500).json({ error: err.message });
     }
@@ -278,6 +421,132 @@ async function startServer() {
     }
   });
 
+  // COMMUNITY SPOTS: GET
+  app.get('/api/communityspots', async (req, res) => {
+    try {
+      if (db) {
+        const q = collection(db, 'community_spots');
+        const snapshot = await getDocs(q);
+        const spots = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        res.json(spots);
+      } else {
+        res.json([]);
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // COMMUNITY SPOTS: POST
+  app.post('/api/communityspots', async (req, res) => {
+    try {
+      const { title, category, location, description, reporterId, reporterName } = req.body;
+      if (!title || !location || !category) {
+        return res.status(400).json({ error: 'Missing title, category, or location.' });
+      }
+
+      if (db) {
+        const payload = {
+          title,
+          category: category || 'safe_haven',
+          location: {
+            lat: Number(location.lat),
+            lng: Number(location.lng)
+          },
+          description: description || 'Resident pinpointed safe community location.',
+          reporterId: reporterId || 'resident',
+          reporterName: reporterName || 'Community Member',
+          upvotes: 0,
+          votedUsers: [],
+          active: false,
+          status: 'pending',
+          approvedByAdmin: false,
+          createdAt: Timestamp.now()
+        };
+
+        const docRef = await addDoc(collection(db, 'community_spots'), payload);
+        // Also sync to camelCase collection for external admin compatibility
+        await setDoc(doc(db, 'communitySpots', docRef.id), payload);
+
+        res.json({ id: docRef.id, message: 'Community spot posted successfully.' });
+      } else {
+        res.json({ id: 'mock-spot-id', message: 'Community spot logged (Mock Mode).' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // COMMUNITY SPOTS: UPVOTE
+  app.post('/api/communityspots/:id/upvote', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { userId } = req.body;
+      if (db) {
+        const spotRef = doc(db, 'community_spots', id);
+        const spotDoc = await getDoc(spotRef);
+        if (spotDoc.exists()) {
+          const spotData = spotDoc.data();
+          const voted = spotData.votedUsers || [];
+          if (!voted.includes(userId)) {
+            const newVoted = [...voted, userId];
+            const newUpvotes = (spotData.upvotes || 0) + 1;
+            await updateDoc(spotRef, { upvotes: newUpvotes, votedUsers: newVoted });
+            // Sync to secondary
+            try {
+              await updateDoc(doc(db, 'communitySpots', id), { upvotes: newUpvotes, votedUsers: newVoted });
+            } catch (e) { /* ignore secondary sync error */ }
+            return res.json({ success: true, upvotes: newUpvotes });
+          }
+          return res.json({ success: true, upvotes: spotData.upvotes, message: 'Already upvoted' });
+        }
+      }
+      res.json({ success: true, message: 'Upvoted (Mock)' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // COMMUNITY SPOTS: UPDATE (Approve / Edit / Pinpoint)
+  app.put('/api/communityspots/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      const dataToUpdate = { ...req.body };
+      if (dataToUpdate.status === 'approved' || dataToUpdate.status === 'active' || dataToUpdate.active === true || dataToUpdate.active === 'true') {
+        dataToUpdate.status = 'approved';
+        dataToUpdate.active = true;
+        dataToUpdate.approvedByAdmin = true;
+      }
+      if (db) {
+        await updateDoc(doc(db, 'community_spots', id), dataToUpdate);
+        try {
+          await updateDoc(doc(db, 'communitySpots', id), dataToUpdate);
+        } catch (e) {}
+        return res.json({ success: true, message: `Community spot ${id} updated.` });
+      }
+      res.json({ success: true, message: 'Updated (Mock)' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // COMMUNITY SPOTS: DELETE (Reject / Remove)
+  app.delete('/api/communityspots/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (db) {
+        await deleteDoc(doc(db, 'community_spots', id));
+        try {
+          await deleteDoc(doc(db, 'communitySpots', id));
+        } catch (e) {}
+        return res.json({ success: true, message: `Community spot ${id} deleted.` });
+      }
+      res.json({ success: true, message: 'Deleted (Mock)' });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
   // REPORTS: GET
   app.get('/api/reports', async (req, res) => {
     try {
@@ -314,6 +583,48 @@ async function startServer() {
         res.json({ id: docRef.id, message: 'Incident report filed successfully.' });
       } else {
         res.json({ id: 'mock-report-id', message: 'Report logged (Mock Mode).' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // REPORTS: DELETE
+  app.delete('/api/reports/:id', async (req, res) => {
+    try {
+      const { id } = req.params;
+      if (db) {
+        const reportCollections = ['reports', 'incident_reports', 'activity_logs'];
+        for (const coll of reportCollections) {
+          try {
+            await deleteDoc(doc(db, coll, id));
+          } catch (e) {}
+        }
+        res.json({ success: true, message: `Report ${id} deleted across all collections.` });
+      } else {
+        res.json({ success: true, message: 'Report deleted (Mock Mode).' });
+      }
+    } catch (err: any) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  // PURGE TEST / DUMMY REPORTS
+  app.post('/api/purge-test-reports', async (req, res) => {
+    try {
+      if (db) {
+        const reportCollections = ['reports', 'incident_reports', 'activity_logs'];
+        let deletedCount = 0;
+        for (const coll of reportCollections) {
+          const snap = await getDocs(collection(db, coll));
+          for (const docSnap of snap.docs) {
+            await deleteDoc(doc(db, coll, docSnap.id));
+            deletedCount++;
+          }
+        }
+        res.json({ success: true, message: `Purged ${deletedCount} records across collections.` });
+      } else {
+        res.json({ success: true, message: 'Purged (Mock Mode).' });
       }
     } catch (err: any) {
       res.status(500).json({ error: err.message });
@@ -435,43 +746,11 @@ async function initializeDatabaseSeeding(db: any) {
       console.log(`[Seeding] Custom database already contains ${snapshotUsers.size} users.`);
     }
 
-    // 3. Seed some default reports
-    const qReports = collection(db, 'reports');
-    const snapshotReports = await getDocs(qReports);
-    if (snapshotReports.empty) {
-      console.log('[Seeding] reports collection is empty! Seeding default incident items...');
-      const seedReports = [
-        {
-          reporterId: "admin",
-          reporterName: "SafeRoute Admin",
-          location: { lat: 14.5590, lng: 120.9975 },
-          description: "Stray dog pack reported near Faraday street park.",
-          status: "approved",
-          category: "animal",
-          createdAt: Timestamp.now(),
-          updatedAt: Timestamp.now()
-        },
-        {
-          reporterId: "user_seed_001",
-          reporterName: "Maria Clara",
-          location: { lat: 14.5615, lng: 120.9980 },
-          description: "Broken streetlight causing street to be dark near Edison corner.",
-          status: "pending",
-          category: "infrastructure",
-          createdAt: Timestamp.now(),
-          updatedAt: Timestamp.now()
-        }
-      ];
+    // 3. Seed some default reports - Disabled so user can maintain a clean, purged database
+    console.log('[Seeding] Skipping default reports seeding to allow clean admin slate.');
 
-      const reportCollections = ['reports', 'incident_reports', 'activity_logs'];
-      for (const rep of seedReports) {
-        const docRef = await addDoc(collection(db, 'reports'), rep);
-        for (const coll of reportCollections) {
-          await setDoc(doc(db, coll, docRef.id), rep);
-        }
-      }
-      console.log('[Seeding] Checked and seeded default reports.');
-    }
+    // 4. Community spots initialization - keep admin approved/activated spots intact
+    console.log('[Seeding] Database initialization complete.');
 
   } catch (err: any) {
     console.error('[Seeding Error] failed to auto-seed database:', err.message);

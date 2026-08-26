@@ -103,20 +103,51 @@ export default function Report() {
     }
   };
 
-  // Image upload
+  // Image upload with automatic client-side compression
   const handlePhotoClick = () => {
     fileInputRef.current?.click();
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setImageUrl(reader.result as string);
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 1200;
+        const MAX_HEIGHT = 1200;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.drawImage(img, 0, 0, width, height);
+          const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.75);
+          setImageUrl(compressedDataUrl);
+        } else {
+          setImageUrl(event.target?.result as string);
+        }
       };
-      reader.readAsDataURL(file);
-    }
+      img.src = event.target?.result as string;
+    };
+    reader.readAsDataURL(file);
   };
 
   const handleRemovePhoto = () => {
@@ -132,11 +163,14 @@ export default function Report() {
     try {
       const category = getCategoryFromText(description);
       
+      const reporterFullName = profile?.name || user.displayName || 'Resident';
+      const reporterContact = user.phoneNumber || profile?.phoneNumber || user.email || profile?.email || 'resident@saferoute.local';
+
       // Submit synced report to all database collections
       await syncReportToAllCollections({
         reporterId: user.uid,
-        reporterName: profile?.name || 'Resident',
-        reporterEmail: user.email || profile?.email || 'resident@saferoute.local',
+        reporterName: reporterFullName,
+        reporterEmail: reporterContact,
         description,
         status: 'pending',
         location,

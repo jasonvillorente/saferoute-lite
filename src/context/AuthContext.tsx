@@ -1,8 +1,8 @@
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { onAuthStateChanged, User } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
+import { doc, getDoc, updateDoc } from 'firebase/firestore';
 import { auth, db } from '../lib/firebase';
-import { UserProfile } from '../types';
+import { UserProfile, UserRole } from '../types';
 import { syncResidentToAllCollections } from '../lib/syncHelper';
 
 interface AuthContextType {
@@ -11,6 +11,7 @@ interface AuthContextType {
   loading: boolean;
   isAdmin: boolean;
   loginAsGuest: () => void;
+  toggleUserRole: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -83,6 +84,30 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const isAdmin = profile?.role === 'admin';
 
+  const toggleUserRole = async () => {
+    if (!profile) return;
+    const newRole: UserRole = profile.role === 'admin' ? 'resident' : 'admin';
+    const updatedProfile: UserProfile = { ...profile, role: newRole };
+    setProfile(updatedProfile);
+
+    if (user && !user.isAnonymous && db) {
+      try {
+        await updateDoc(doc(db, 'users', user.uid), { role: newRole });
+      } catch (e) {
+        console.warn('Could not persist role in Firestore:', e);
+      }
+    } else {
+      const guestDataStr = localStorage.getItem('safe_route_guest');
+      if (guestDataStr) {
+        try {
+          const guest = JSON.parse(guestDataStr);
+          guest.profile.role = newRole;
+          localStorage.setItem('safe_route_guest', JSON.stringify(guest));
+        } catch (e) {}
+      }
+    }
+  };
+
   const loginAsGuest = () => {
     const guestSession = {
       user: {
@@ -106,7 +131,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   return (
-    <AuthContext.Provider value={{ user, profile, loading, isAdmin, loginAsGuest }}>
+    <AuthContext.Provider value={{ user, profile, loading, isAdmin, loginAsGuest, toggleUserRole }}>
       {children}
     </AuthContext.Provider>
   );

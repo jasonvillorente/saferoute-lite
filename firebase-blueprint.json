@@ -68,12 +68,33 @@
         "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" }
       },
       "required": ["userId", "name", "category", "location", "useCount", "createdAt"]
+    },
+    "CommunitySpot": {
+      "title": "CommunitySpot",
+      "description": "A community-verified safe or enjoyed spot reported by residents.",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "description": "Display title of the spot" },
+        "category": { "type": "string", "enum": ["safe_haven", "well_lit", "friendly_business", "community_hub", "enjoyed_spot"], "description": "Classification category" },
+        "location": { "type": "object", "description": "Geopoint: { lat, lng }" },
+        "description": { "type": "string", "description": "Description of why this spot is safe or enjoyed" },
+        "reporterId": { "type": "string", "description": "UID of the user who added this spot" },
+        "reporterName": { "type": "string", "description": "Name of reporter" },
+        "upvotes": { "type": "number", "description": "Number of resident validations/likes" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Creation timestamp" },
+        "active": { "type": "boolean", "description": "Active status" }
+      },
+      "required": ["title", "category", "location", "description", "reporterId", "upvotes", "createdAt", "active"]
     }
   },
   "firestore": {
     "/users/{userId}": {
       "schema": "User",
       "description": "Individual user profiles"
+    },
+    "/community_spots/{spotId}": {
+      "schema": "CommunitySpot",
+      "description": "Community spots and safe places"
     },
     "/saved_places/{placeId}": {
       "schema": "SavedPlace",

@@ -2,12 +2,39 @@ import { Timestamp } from 'firebase/firestore';
 
 export type UserRole = 'resident' | 'admin';
 
+export interface PrivacySettings {
+  anonymousReporting: boolean;
+  maskCommunitySpotName: boolean;
+  preciseGpsInSos: boolean;
+  storeRouteHistory: boolean;
+  shareSafetyTelemetry: boolean;
+}
+
+export interface SecuritySettings {
+  twoFactorAuth: boolean;
+  loginAlerts: boolean;
+  biometricPrompt: boolean;
+  criticalOverrides: boolean;
+}
+
 export interface UserProfile {
   uid: string;
   name: string;
   email: string;
+  phoneNumber?: string;
+  phone?: string;
+  mobileNumber?: string;
+  authMethod?: 'email' | 'phone' | 'google';
+  authProvider?: 'email' | 'phone' | 'google';
+  provider?: 'email' | 'phone' | 'google';
+  authType?: 'email' | 'phone' | 'google';
+  isPhoneAuth?: boolean;
+  registrationType?: 'email' | 'phone' | 'google';
+  phoneBridgeEmail?: string;
   role: UserRole;
   createdAt: Timestamp;
+  privacySettings?: PrivacySettings;
+  securitySettings?: SecuritySettings;
 }
 
 export type ReportStatus = 'pending' | 'approved' | 'rejected';
@@ -41,6 +68,25 @@ export interface DangerZone {
   riskLevel?: 'low' | 'moderate' | 'high' | 'critical';
   type?: 'marker' | 'circle' | 'polygon';
   polygonPoints?: [number, number][];
+  status?: string;
+  resolved?: boolean;
+  isResolved?: boolean;
+  resolutionStatus?: string;
+}
+
+/**
+ * Checks if a danger zone or incident report is marked as resolved / closed / inactive.
+ * When marked as resolved, it is excluded from safety route risk penalties and hazard circles.
+ */
+export function isZoneResolved(zone: any): boolean {
+  if (!zone) return false;
+  if (zone.resolved === true || zone.resolved === 'true') return true;
+  if (zone.isResolved === true || zone.isResolved === 'true') return true;
+  if (zone.resolutionStatus === 'resolved' || zone.resolutionStatus === 'closed') return true;
+  const status = String(zone.status || '').trim().toLowerCase();
+  if (status === 'resolved' || status === 'closed' || status === 'archived' || status === 'inactive') return true;
+  if (zone.active === false || zone.active === 'false') return true;
+  return false;
 }
 
 export interface Notification {
@@ -53,6 +99,27 @@ export interface Notification {
 }
 
 export type PlaceCategory = 'home' | 'school' | 'work' | 'hospital' | 'store' | 'favorite' | 'custom';
+
+export type CommunitySpotCategory = 'safe_haven' | 'well_lit' | 'friendly_business' | 'community_hub' | 'enjoyed_spot';
+
+export interface CommunitySpot {
+  id: string;
+  title: string;
+  category: CommunitySpotCategory;
+  location: {
+    lat: number;
+    lng: number;
+  };
+  description: string;
+  reporterId: string;
+  reporterName?: string;
+  upvotes: number;
+  votedUsers?: string[];
+  createdAt: Timestamp;
+  active: boolean;
+  status?: 'pending' | 'approved' | 'rejected';
+  approvedByAdmin?: boolean;
+}
 
 export interface SavedPlace {
   id: string;

@@ -1,20 +1,11 @@
 import React from 'react';
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { Home, Map, ShieldAlert, User, Bell, LogOut, Sun, Moon } from 'lucide-react';
-import { useAuth } from '../context/AuthContext';
+import { Outlet, NavLink } from 'react-router-dom';
+import { Home, Map, ShieldAlert, User, Bell } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
-import { auth } from '../lib/firebase';
 import { cn } from '../lib/utils';
 
 export default function Layout() {
-  const navigate = useNavigate();
-  const { darkMode, toggleDarkMode } = useTheme();
-
-  const handleLogout = async () => {
-    localStorage.removeItem('safe_route_guest');
-    await auth.signOut();
-    navigate('/login');
-  };
+  const { darkMode } = useTheme();
 
   const navItems = [
     { to: '/', icon: Home, label: 'Home' },
@@ -40,30 +31,6 @@ export default function Layout() {
         )}>
           SafeRoute Lite
         </span>
-        <div className="flex items-center gap-2">
-          {/* Global Theme Toggle Button */}
-          <button 
-            onClick={toggleDarkMode}
-            className={cn(
-              "p-1.5 rounded-full transition-all active:scale-95",
-              darkMode ? "hover:bg-slate-850 text-yellow-400" : "hover:bg-slate-100 text-blue-600"
-            )}
-            title="Toggle Theme"
-          >
-            {darkMode ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
-          </button>
-
-          <button 
-            onClick={handleLogout}
-            className={cn(
-              "p-1.5 rounded-full transition-colors",
-              darkMode ? "hover:bg-slate-850 text-slate-400 hover:text-slate-200" : "hover:bg-slate-100 text-slate-500"
-            )}
-            title="Sign Out"
-          >
-            <LogOut className="w-5 h-5" />
-          </button>
-        </div>
       </header>
 
       {/* Main Content Area */}
