@@ -1,0 +1,9 @@
+{
+  "appId": "ph.saferoute.app",
+  "appName": "SafeRoute Lite",
+  "webDir": "dist",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  }
+}
