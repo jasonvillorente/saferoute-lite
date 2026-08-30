@@ -67,6 +67,7 @@ import {
   Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { LocationAccuracyModal } from '../components/LocationAccuracyModal';
 
 // Leaflet markers shadow url
 const markerShadow = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png';
@@ -532,6 +533,7 @@ export default function MapPage() {
   const darkMode = false;
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [permissionError, setPermissionError] = useState(false);
+  const [showLocationAccuracyModal, setShowLocationAccuracyModal] = useState(false);
   
   // Dynamic route analytics and safety segmentation helper
   const processRouteCoordinates = (coordinates: [number, number][], distance: number) => {
@@ -738,11 +740,81 @@ export default function MapPage() {
 
   // Continuous real-time GPS tracking listener
   const hasInitiallyCentered = useRef(false);
+  const userInteractedWithLocationModal = useRef(false);
+
+  // Trigger Location Accuracy dialog action to turn on GPS
+  const handleTurnOnLocationAccuracy = () => {
+    userInteractedWithLocationModal.current = true;
+    setShowLocationAccuracyModal(false);
+    setAutoFollowGps(true);
+
+    if (!navigator.geolocation) {
+      setToastMessage("⚠️ Geolocation is not supported by your device.");
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const accuracy = pos.coords.accuracy;
+        const heading = pos.coords.heading;
+        const speed = pos.coords.speed;
+        const newCoords: [number, number] = [lat, lng];
+
+        setLiveGpsCoords(newCoords);
+        setLiveGpsAccuracy(accuracy);
+        if (typeof heading === 'number' && !isNaN(heading)) setLiveGpsHeading(heading);
+        if (typeof speed === 'number' && !isNaN(speed)) setLiveGpsSpeed(speed);
+
+        if (mapRef.current) {
+          mapRef.current.setView(newCoords, 17, { animate: true });
+        }
+        if (!startPoint) {
+          setStartPoint(newCoords);
+        }
+        if (endPoint) {
+          calculateSafeDirections(newCoords, endPoint);
+        }
+      },
+      (err) => {
+        console.warn("GPS lookup on turn on:", err);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  const handleDismissLocationAccuracy = () => {
+    userInteractedWithLocationModal.current = true;
+    setShowLocationAccuracyModal(false);
+  };
 
   useEffect(() => {
-    if (!navigator.geolocation) return;
+    if (!navigator.geolocation) {
+      setShowLocationAccuracyModal(true);
+      return;
+    }
+
+    let gpsActive = false;
+
+    // Check permission status on mount
+    if ('permissions' in navigator && navigator.permissions.query) {
+      navigator.permissions.query({ name: 'geolocation' }).then((result) => {
+        if (!userInteractedWithLocationModal.current && (result.state === 'prompt' || result.state === 'denied')) {
+          setShowLocationAccuracyModal(true);
+        }
+        result.onchange = () => {
+          if (result.state === 'granted') {
+            setShowLocationAccuracyModal(false);
+            handleTurnOnLocationAccuracy();
+          }
+        };
+      }).catch(() => {});
+    }
 
     const onLocationUpdate = (pos: GeolocationPosition) => {
+      gpsActive = true;
+      setShowLocationAccuracyModal(false);
       const lat = pos.coords.latitude;
       const lng = pos.coords.longitude;
       const accuracy = pos.coords.accuracy;
@@ -783,22 +855,33 @@ export default function MapPage() {
 
     const onError = (err: GeolocationPositionError) => {
       console.warn("GPS tracking status:", err.message);
-      if (err.code === 1) {
-        setToastMessage("⚠️ Location permission is blocked. Please tap the lock/settings icon in your browser to Allow Location, and ensure phone GPS is ON.");
+      if (!userInteractedWithLocationModal.current && !gpsActive) {
+        setShowLocationAccuracyModal(true);
       }
     };
 
     // Immediate initial high accuracy GPS query on mount
-    navigator.geolocation.getCurrentPosition(onLocationUpdate, (err) => {
-      console.warn("Initial GPS position check:", err.message);
-      if (err.code === 1) {
-        setToastMessage("⚠️ Location permission is blocked. Please tap the lock/settings icon in your browser to Allow Location, and ensure phone GPS is ON.");
+    navigator.geolocation.getCurrentPosition(
+      onLocationUpdate,
+      (err) => {
+        console.warn("Initial GPS position check:", err.message);
+        if (!userInteractedWithLocationModal.current && !gpsActive) {
+          setShowLocationAccuracyModal(true);
+        }
+      },
+      {
+        enableHighAccuracy: true,
+        timeout: 5000,
+        maximumAge: 0
       }
-    }, {
-      enableHighAccuracy: true,
-      timeout: 10000,
-      maximumAge: 0
-    });
+    );
+
+    // Timeout safety fallback: if no GPS fix received within 2.5 seconds, trigger modal
+    const gpsTimeoutCheck = setTimeout(() => {
+      if (!gpsActive && !userInteractedWithLocationModal.current) {
+        setShowLocationAccuracyModal(true);
+      }
+    }, 2500);
 
     watchIdRef.current = navigator.geolocation.watchPosition(onLocationUpdate, onError, {
       enableHighAccuracy: true,
@@ -807,6 +890,7 @@ export default function MapPage() {
     });
 
     return () => {
+      clearTimeout(gpsTimeoutCheck);
       if (watchIdRef.current !== null) {
         navigator.geolocation.clearWatch(watchIdRef.current);
       }
@@ -1979,7 +2063,7 @@ export default function MapPage() {
     setAutoFollowGps(true);
 
     if (!navigator.geolocation) {
-      setToastMessage("⚠️ Geolocation is not supported by your device browser.");
+      setShowLocationAccuracyModal(true);
       return;
     }
 
@@ -2013,15 +2097,8 @@ export default function MapPage() {
       },
       (err) => {
         console.warn("GPS lookup error:", err);
-        let msg = "Could not detect GPS location.";
-        if (err.code === 1) {
-          msg = "Location permission denied. Please allow Location access in your browser / site settings.";
-        } else if (err.code === 2) {
-          msg = "Position unavailable. Please ensure GPS / Location is turned on.";
-        } else if (err.code === 3) {
-          msg = "Location request timed out. Please tap the compass to retry.";
-        }
-        setToastMessage(`⚠️ ${msg}`);
+        // Open Google Maps style Location Accuracy dialog
+        setShowLocationAccuracyModal(true);
       },
       { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
     );
@@ -3751,7 +3828,12 @@ export default function MapPage() {
         )}
       </AnimatePresence>
 
-
+      {/* SafeRoute Lite Location Accuracy Dialog */}
+      <LocationAccuracyModal
+        isOpen={showLocationAccuracyModal}
+        onTurnOn={handleTurnOnLocationAccuracy}
+        onDismiss={handleDismissLocationAccuracy}
+      />
 
     </div>
   );
