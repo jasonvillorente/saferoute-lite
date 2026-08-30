@@ -16,7 +16,8 @@ export async function checkLocationPermission(): Promise<'granted' | 'prompt' | 
   try {
     if (Capacitor.isNativePlatform()) {
       const status = await Geolocation.checkPermissions();
-      if (status.location === 'granted') {
+      console.log('Native permission status:', status);
+      if (status.location === 'granted' || status.coarseLocation === 'granted') {
         return 'granted';
       }
       if (status.location === 'denied') {
@@ -44,8 +45,24 @@ export async function checkLocationPermission(): Promise<'granted' | 'prompt' | 
 export async function requestLocationPermission(): Promise<boolean> {
   try {
     if (Capacitor.isNativePlatform()) {
-      const status = await Geolocation.requestPermissions({ permissions: ['location', 'coarseLocation'] });
-      return status.location === 'granted';
+      // In Capacitor, calling requestPermissions() triggers the native Android OS prompt
+      let status;
+      try {
+        status = await Geolocation.requestPermissions();
+      } catch {
+        status = await Geolocation.requestPermissions({ permissions: ['location', 'coarseLocation'] });
+      }
+      console.log('Native permission requested result:', status);
+      if (status.location === 'granted' || status.coarseLocation === 'granted') {
+        return true;
+      }
+      // Try fetching position directly in case OS granted it
+      try {
+        await Geolocation.getCurrentPosition({ timeout: 5000 });
+        return true;
+      } catch {
+        return false;
+      }
     } else {
       // In browser, trigger a small getCurrentPosition check to invoke browser prompt
       return new Promise<boolean>((resolve) => {
