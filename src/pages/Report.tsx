@@ -5,6 +5,7 @@ import L from 'leaflet';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { syncReportToAllCollections } from '../lib/syncHelper';
+import { getCurrentGpsPosition, requestLocationPermission } from '../lib/nativeLocation';
 import { 
   AlertTriangle, 
   MapPin, 
@@ -70,31 +71,16 @@ export default function Report() {
   };
 
   // Geolocation trigger
-  const handleGetLocation = () => {
+  const handleGetLocation = async () => {
     setGeolocationLoading(true);
-    if (navigator.geolocation) {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
-          const newLoc = { lat: position.coords.latitude, lng: position.coords.longitude };
-          setLocation(newLoc);
-          setGeolocationLoading(false);
-          setShowMap(true);
-          // Trigger a window resize event to allow Leaflet to recalculate space
-          setTimeout(() => {
-            window.dispatchEvent(new Event('resize'));
-          }, 150);
-        },
-        (error) => {
-          console.warn('Geolocation failed, falling back to default/manual selection:', error);
-          setGeolocationLoading(false);
-          setShowMap(true);
-          setTimeout(() => {
-            window.dispatchEvent(new Event('resize'));
-          }, 150);
-        },
-        { enableHighAccuracy: true, timeout: 10000 }
-      );
-    } else {
+    try {
+      await requestLocationPermission();
+      const pos = await getCurrentGpsPosition();
+      const newLoc = { lat: pos.latitude, lng: pos.longitude };
+      setLocation(newLoc);
+    } catch (error) {
+      console.warn('Geolocation failed, falling back to default/manual selection:', error);
+    } finally {
       setGeolocationLoading(false);
       setShowMap(true);
       setTimeout(() => {

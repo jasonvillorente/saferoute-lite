@@ -6,6 +6,13 @@ import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { useAuth } from '../context/AuthContext';
 import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords, CommunitySpot, CommunitySpotCategory, isZoneResolved } from '../types';
+import { 
+  checkLocationPermission, 
+  requestLocationPermission, 
+  getCurrentGpsPosition, 
+  watchGpsPosition, 
+  GpsLocationResult 
+} from '../lib/nativeLocation';
 
 // In-memory route caching to eliminate public OSRM rate limiting & APK WebView network delays
 const globalRouteCache = new Map<string, any>();
@@ -743,45 +750,38 @@ export default function MapPage() {
   const userInteractedWithLocationModal = useRef(false);
 
   // Trigger Location Accuracy dialog action to turn on GPS
-  const handleTurnOnLocationAccuracy = () => {
+  const handleTurnOnLocationAccuracy = async () => {
     userInteractedWithLocationModal.current = true;
     setShowLocationAccuracyModal(false);
     setAutoFollowGps(true);
 
-    if (!navigator.geolocation) {
-      setToastMessage("⚠️ Geolocation is not supported by your device.");
-      return;
+    try {
+      const granted = await requestLocationPermission();
+      if (!granted) {
+        setToastMessage("⚠️ Location permission needed to find safer routes in real-time.");
+        return;
+      }
+
+      const pos = await getCurrentGpsPosition();
+      const newCoords: [number, number] = [pos.latitude, pos.longitude];
+
+      setLiveGpsCoords(newCoords);
+      setLiveGpsAccuracy(pos.accuracy);
+      if (typeof pos.heading === 'number' && !isNaN(pos.heading)) setLiveGpsHeading(pos.heading);
+      if (typeof pos.speed === 'number' && !isNaN(pos.speed)) setLiveGpsSpeed(pos.speed);
+
+      if (mapRef.current) {
+        mapRef.current.setView(newCoords, 17, { animate: true });
+      }
+      if (!startPoint) {
+        setStartPoint(newCoords);
+      }
+      if (endPoint) {
+        calculateSafeDirections(newCoords, endPoint);
+      }
+    } catch (err) {
+      console.warn("GPS lookup on turn on:", err);
     }
-
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        const accuracy = pos.coords.accuracy;
-        const heading = pos.coords.heading;
-        const speed = pos.coords.speed;
-        const newCoords: [number, number] = [lat, lng];
-
-        setLiveGpsCoords(newCoords);
-        setLiveGpsAccuracy(accuracy);
-        if (typeof heading === 'number' && !isNaN(heading)) setLiveGpsHeading(heading);
-        if (typeof speed === 'number' && !isNaN(speed)) setLiveGpsSpeed(speed);
-
-        if (mapRef.current) {
-          mapRef.current.setView(newCoords, 17, { animate: true });
-        }
-        if (!startPoint) {
-          setStartPoint(newCoords);
-        }
-        if (endPoint) {
-          calculateSafeDirections(newCoords, endPoint);
-        }
-      },
-      (err) => {
-        console.warn("GPS lookup on turn on:", err);
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
   };
 
   const handleDismissLocationAccuracy = () => {
@@ -790,36 +790,17 @@ export default function MapPage() {
   };
 
   useEffect(() => {
-    if (!navigator.geolocation) {
-      setShowLocationAccuracyModal(true);
-      return;
-    }
+    let isMounted = true;
+    let cleanupWatcher: (() => void) | null = null;
 
-    let gpsActive = false;
-
-    // Check permission status on mount
-    if ('permissions' in navigator && navigator.permissions.query) {
-      navigator.permissions.query({ name: 'geolocation' }).then((result) => {
-        if (!userInteractedWithLocationModal.current && (result.state === 'prompt' || result.state === 'denied')) {
-          setShowLocationAccuracyModal(true);
-        }
-        result.onchange = () => {
-          if (result.state === 'granted') {
-            setShowLocationAccuracyModal(false);
-            handleTurnOnLocationAccuracy();
-          }
-        };
-      }).catch(() => {});
-    }
-
-    const onLocationUpdate = (pos: GeolocationPosition) => {
-      gpsActive = true;
+    const onLocationUpdate = (pos: GpsLocationResult) => {
+      if (!isMounted) return;
       setShowLocationAccuracyModal(false);
-      const lat = pos.coords.latitude;
-      const lng = pos.coords.longitude;
-      const accuracy = pos.coords.accuracy;
-      const heading = pos.coords.heading;
-      const speed = pos.coords.speed;
+      const lat = pos.latitude;
+      const lng = pos.longitude;
+      const accuracy = pos.accuracy;
+      const heading = pos.heading;
+      const speed = pos.speed;
 
       const newCoords: [number, number] = [lat, lng];
       setLiveGpsCoords(newCoords);
@@ -853,46 +834,28 @@ export default function MapPage() {
       }
     };
 
-    const onError = (err: GeolocationPositionError) => {
-      console.warn("GPS tracking status:", err.message);
-      if (!userInteractedWithLocationModal.current && !gpsActive) {
+    // Check permission status on startup
+    checkLocationPermission().then((status) => {
+      if (!isMounted) return;
+      if (status === 'granted') {
+        setShowLocationAccuracyModal(false);
+        getCurrentGpsPosition().then(onLocationUpdate).catch((e) => console.warn(e));
+      } else if (!userInteractedWithLocationModal.current) {
         setShowLocationAccuracyModal(true);
       }
-    };
+    });
 
-    // Immediate initial high accuracy GPS query on mount
-    navigator.geolocation.getCurrentPosition(
+    cleanupWatcher = watchGpsPosition(
       onLocationUpdate,
       (err) => {
-        console.warn("Initial GPS position check:", err.message);
-        if (!userInteractedWithLocationModal.current && !gpsActive) {
-          setShowLocationAccuracyModal(true);
-        }
-      },
-      {
-        enableHighAccuracy: true,
-        timeout: 5000,
-        maximumAge: 0
+        console.warn("GPS tracking status:", err);
       }
     );
 
-    // Timeout safety fallback: if no GPS fix received within 2.5 seconds, trigger modal
-    const gpsTimeoutCheck = setTimeout(() => {
-      if (!gpsActive && !userInteractedWithLocationModal.current) {
-        setShowLocationAccuracyModal(true);
-      }
-    }, 2500);
-
-    watchIdRef.current = navigator.geolocation.watchPosition(onLocationUpdate, onError, {
-      enableHighAccuracy: true,
-      maximumAge: 1000,
-      timeout: 15000,
-    });
-
     return () => {
-      clearTimeout(gpsTimeoutCheck);
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current);
+      isMounted = false;
+      if (cleanupWatcher) {
+        cleanupWatcher();
       }
     };
   }, [autoFollowGps, zones, isSimulating]);
@@ -2059,49 +2022,43 @@ export default function MapPage() {
   };
 
   // Floating button GPS locator and center trigger
-  const handleLocateAndCenter = () => {
+  const handleLocateAndCenter = async () => {
     setAutoFollowGps(true);
-
-    if (!navigator.geolocation) {
-      setShowLocationAccuracyModal(true);
-      return;
-    }
-
     setToastMessage("🛰️ Detecting your live GPS location...");
 
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const lat = pos.coords.latitude;
-        const lng = pos.coords.longitude;
-        const accuracy = pos.coords.accuracy;
-        const heading = pos.coords.heading;
-        const speed = pos.coords.speed;
-        const gpsCoords: [number, number] = [lat, lng];
-
-        setLiveGpsCoords(gpsCoords);
-        setLiveGpsAccuracy(accuracy);
-        if (typeof heading === 'number' && !isNaN(heading)) setLiveGpsHeading(heading);
-        if (typeof speed === 'number' && !isNaN(speed)) setLiveGpsSpeed(speed);
-
-        if (mapRef.current) {
-          mapRef.current.setView(gpsCoords, 17, { animate: true });
+    try {
+      const status = await checkLocationPermission();
+      if (status !== 'granted') {
+        const granted = await requestLocationPermission();
+        if (!granted) {
+          setShowLocationAccuracyModal(true);
+          return;
         }
-        if (!startPoint) {
-          setStartPoint(gpsCoords);
-        }
-        if (endPoint) {
-          calculateSafeDirections(gpsCoords, endPoint);
-        }
+      }
 
-        setToastMessage(`📍 GPS Located! Precision: ±${Math.round(accuracy)}m`);
-      },
-      (err) => {
-        console.warn("GPS lookup error:", err);
-        // Open Google Maps style Location Accuracy dialog
-        setShowLocationAccuracyModal(true);
-      },
-      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
-    );
+      const pos = await getCurrentGpsPosition();
+      const gpsCoords: [number, number] = [pos.latitude, pos.longitude];
+
+      setLiveGpsCoords(gpsCoords);
+      setLiveGpsAccuracy(pos.accuracy);
+      if (typeof pos.heading === 'number' && !isNaN(pos.heading)) setLiveGpsHeading(pos.heading);
+      if (typeof pos.speed === 'number' && !isNaN(pos.speed)) setLiveGpsSpeed(pos.speed);
+
+      if (mapRef.current) {
+        mapRef.current.setView(gpsCoords, 17, { animate: true });
+      }
+      if (!startPoint) {
+        setStartPoint(gpsCoords);
+      }
+      if (endPoint) {
+        calculateSafeDirections(gpsCoords, endPoint);
+      }
+
+      setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
+    } catch (err) {
+      console.warn("GPS lookup error:", err);
+      setShowLocationAccuracyModal(true);
+    }
   };
 
   // Zoom controls wrappers
