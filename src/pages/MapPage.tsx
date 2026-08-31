@@ -74,7 +74,6 @@ import {
   Trash2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { LocationAccuracyModal } from '../components/LocationAccuracyModal';
 
 // Leaflet markers shadow url
 const markerShadow = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png';
@@ -540,7 +539,6 @@ export default function MapPage() {
   const darkMode = false;
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [permissionError, setPermissionError] = useState(false);
-  const [showLocationAccuracyModal, setShowLocationAccuracyModal] = useState(false);
   
   // Dynamic route analytics and safety segmentation helper
   const processRouteCoordinates = (coordinates: [number, number][], distance: number) => {
@@ -747,47 +745,6 @@ export default function MapPage() {
 
   // Continuous real-time GPS tracking listener
   const hasInitiallyCentered = useRef(false);
-  const userInteractedWithLocationModal = useRef(false);
-
-  // Trigger Location Accuracy dialog action to turn on GPS
-  const handleTurnOnLocationAccuracy = async () => {
-    userInteractedWithLocationModal.current = true;
-    setShowLocationAccuracyModal(false);
-    setAutoFollowGps(true);
-
-    try {
-      const granted = await requestLocationPermission();
-      if (!granted) {
-        setToastMessage("⚠️ Location permission needed to find safer routes in real-time.");
-        return;
-      }
-
-      const pos = await getCurrentGpsPosition();
-      const newCoords: [number, number] = [pos.latitude, pos.longitude];
-
-      setLiveGpsCoords(newCoords);
-      setLiveGpsAccuracy(pos.accuracy);
-      if (typeof pos.heading === 'number' && !isNaN(pos.heading)) setLiveGpsHeading(pos.heading);
-      if (typeof pos.speed === 'number' && !isNaN(pos.speed)) setLiveGpsSpeed(pos.speed);
-
-      if (mapRef.current) {
-        mapRef.current.setView(newCoords, 17, { animate: true });
-      }
-      if (!startPoint) {
-        setStartPoint(newCoords);
-      }
-      if (endPoint) {
-        calculateSafeDirections(newCoords, endPoint);
-      }
-    } catch (err) {
-      console.warn("GPS lookup on turn on:", err);
-    }
-  };
-
-  const handleDismissLocationAccuracy = () => {
-    userInteractedWithLocationModal.current = true;
-    setShowLocationAccuracyModal(false);
-  };
 
   useEffect(() => {
     let isMounted = true;
@@ -795,7 +752,6 @@ export default function MapPage() {
 
     const onLocationUpdate = (pos: GpsLocationResult) => {
       if (!isMounted) return;
-      setShowLocationAccuracyModal(false);
       const lat = pos.latitude;
       const lng = pos.longitude;
       const accuracy = pos.accuracy;
@@ -834,14 +790,17 @@ export default function MapPage() {
       }
     };
 
-    // Check permission status on startup
+    // Auto-request or check location permission on startup directly with native device dialog
     checkLocationPermission().then((status) => {
       if (!isMounted) return;
       if (status === 'granted') {
-        setShowLocationAccuracyModal(false);
         getCurrentGpsPosition().then(onLocationUpdate).catch((e) => console.warn(e));
-      } else if (!userInteractedWithLocationModal.current) {
-        setShowLocationAccuracyModal(true);
+      } else {
+        requestLocationPermission().then((granted) => {
+          if (granted && isMounted) {
+            getCurrentGpsPosition().then(onLocationUpdate).catch((e) => console.warn(e));
+          }
+        }).catch((e) => console.warn(e));
       }
     });
 
@@ -938,24 +897,10 @@ export default function MapPage() {
           } as SavedPlace;
         });
         
-        const seedKey = `saferoute_seeded_${user.uid}`;
-        // If empty, only auto-seed if they have never been seeded before
-        if (places.length === 0) {
-          if (!localStorage.getItem(seedKey)) {
-            localStorage.setItem(seedKey, 'true');
-            seedDefaultPlaces(user.uid);
-          } else {
-            setSavedPlaces([]);
-            setLoadingSavedPlaces(false);
-          }
-        } else {
-          // Guard and set seeded state to true
-          localStorage.setItem(seedKey, 'true');
-          // Sort by useCount desc (favorites first), then by createdAt desc
-          places.sort((a, b) => b.useCount - a.useCount || (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
-          setSavedPlaces(places);
-          setLoadingSavedPlaces(false);
-        }
+        // Sort by useCount desc (favorites first), then by createdAt desc
+        places.sort((a, b) => b.useCount - a.useCount || (b.createdAt?.seconds || 0) - (a.createdAt?.seconds || 0));
+        setSavedPlaces(places);
+        setLoadingSavedPlaces(false);
       }, (error) => {
         handleFirestoreError(error, OperationType.GET, 'saved_places');
         setLoadingSavedPlaces(false);
@@ -972,10 +917,7 @@ export default function MapPage() {
           console.error(e);
         }
       } else {
-        // Seed default places in localStorage for guest
-        const guestSeed = getSeedPlaces('guest');
-        localStorage.setItem('saved_places_guest', JSON.stringify(guestSeed));
-        setSavedPlaces(guestSeed);
+        setSavedPlaces([]);
       }
       setLoadingSavedPlaces(false);
     }
@@ -1006,7 +948,7 @@ export default function MapPage() {
           }
         });
 
-        // 2. Clean up school, office (work), hospital saved places for the logged-in user or guest
+        // 2. Clean up seed-home, school, office (work), hospital saved places for the logged-in user or guest
         const uid = user ? user.uid : 'guest';
         const qPlaces = query(collection(db, 'saved_places'), where('userId', '==', uid));
         const snapPlaces = await getDocs(qPlaces);
@@ -1021,9 +963,12 @@ export default function MapPage() {
             name.includes('school') ||
             name.includes('office') ||
             name.includes('hospital') ||
+            docSnap.id === 'seed-home' ||
             docSnap.id === 'seed-school' ||
             docSnap.id === 'seed-work' ||
-            docSnap.id === 'seed-hospital'
+            docSnap.id === 'seed-hospital' ||
+            name === 'my home 🏠' ||
+            (data.location?.lat === 14.56200 && data.location?.lng === 120.99845)
           ) {
             await deleteDoc(doc(db, 'saved_places', docSnap.id));
           }
@@ -1044,9 +989,12 @@ export default function MapPage() {
                 name.includes('school') ||
                 name.includes('office') ||
                 name.includes('hospital') ||
+                p.id === 'seed-home' ||
                 p.id === 'seed-school' ||
                 p.id === 'seed-work' ||
-                p.id === 'seed-hospital'
+                p.id === 'seed-hospital' ||
+                name === 'my home 🏠' ||
+                (p.location?.lat === 14.56200 && p.location?.lng === 120.99845)
               );
             });
             localStorage.setItem('saved_places_guest', JSON.stringify(cleaned));
@@ -1061,36 +1009,6 @@ export default function MapPage() {
 
     performCleanup();
   }, [user]);
-
-  // Seed default places helper
-  const getSeedPlaces = (uid: string): SavedPlace[] => {
-    return [
-      {
-        id: 'seed-home',
-        userId: uid,
-        name: 'My Home 🏠',
-        category: 'home',
-        icon: '🏠',
-        location: { lat: 14.56200, lng: 120.99845 }, // Faraday Park area
-        address: 'Faraday Street, Palanan, Makati',
-        useCount: 5,
-        createdAt: Timestamp.now()
-      }
-    ];
-  };
-
-  const seedDefaultPlaces = async (uid: string) => {
-    try {
-      const seeds = getSeedPlaces(uid);
-      const batchPromises = seeds.map(async (seed) => {
-        const { id, ...data } = seed;
-        await addDoc(collection(db, 'saved_places'), data);
-      });
-      await Promise.all(batchPromises);
-    } catch (e) {
-      console.error("Error seeding default places:", e);
-    }
-  };
 
   // Ref hook to trigger custom map viewport action hooks
   const mapRef = useRef<L.Map | null>(null);
@@ -2031,7 +1949,7 @@ export default function MapPage() {
       if (status !== 'granted') {
         const granted = await requestLocationPermission();
         if (!granted) {
-          setShowLocationAccuracyModal(true);
+          setToastMessage("⚠️ Location permission is required to detect your location.");
           return;
         }
       }
@@ -2057,7 +1975,7 @@ export default function MapPage() {
       setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
     } catch (err) {
       console.warn("GPS lookup error:", err);
-      setShowLocationAccuracyModal(true);
+      setToastMessage("⚠️ Unable to acquire GPS lock. Please check your device location settings.");
     }
   };
 
@@ -3784,13 +3702,6 @@ export default function MapPage() {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* SafeRoute Lite Location Accuracy Dialog */}
-      <LocationAccuracyModal
-        isOpen={showLocationAccuracyModal}
-        onTurnOn={handleTurnOnLocationAccuracy}
-        onDismiss={handleDismissLocationAccuracy}
-      />
 
     </div>
   );
