@@ -5,6 +5,16 @@
 **/.idea/
 *.iml
 
+# Project dependencies and build output
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
 # Built application files
 *.apk
 *.aar
