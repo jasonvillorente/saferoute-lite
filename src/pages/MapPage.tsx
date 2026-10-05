@@ -6,6 +6,8 @@ import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { useAuth } from '../context/AuthContext';
 import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords, CommunitySpot, CommunitySpotCategory, isZoneResolved } from '../types';
+import { DEMO_MODE } from '../config/demo';
+import { isInsidePalanan } from '../lib/palananBounds';
 import { 
   checkLocationPermission, 
   requestLocationPermission, 
@@ -188,21 +190,28 @@ const userIcon = L.icon({
 });
 
 // Real-time live user GPS puck with pulsing radar ripple & direction beam
-const createLiveGpsPuckIcon = (heading: number | null = null) => {
+const createLiveGpsPuckIcon = (heading: number | null = null, isOutside: boolean = false) => {
   const hasHeading = typeof heading === 'number' && !isNaN(heading);
   const headingTransform = hasHeading ? `transform: rotate(${heading}deg);` : '';
+  const mainColor = isOutside ? '#ef4444' : '#3b82f6';
+  const pingColor = isOutside ? 'rgba(239, 68, 68, 0.4)' : 'rgba(59, 130, 246, 0.3)';
+  const pulseColor = isOutside ? 'rgba(239, 68, 68, 0.5)' : 'rgba(59, 130, 246, 0.4)';
+  const coreBg = isOutside ? 'bg-red-600' : 'bg-blue-600';
 
   return L.divIcon({
     html: `
       <div class="relative flex items-center justify-center w-10 h-10 -ml-5 -mt-5">
         ${hasHeading ? `
-          <div class="absolute -top-3 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-b-[12px] border-b-blue-500 opacity-80" style="${headingTransform} transform-origin: 50% 20px;"></div>
+          <div class="absolute -top-3 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-b-[12px] opacity-90" style="border-b-color: ${mainColor}; ${headingTransform} transform-origin: 50% 20px;"></div>
         ` : ''}
-        <span class="absolute w-8 h-8 rounded-full bg-blue-500/30 animate-ping"></span>
-        <span class="absolute w-6 h-6 rounded-full bg-blue-500/40"></span>
-        <div class="relative w-4 h-4 rounded-full bg-blue-600 border-2 border-white shadow-md flex items-center justify-center">
+        <span class="absolute w-8 h-8 rounded-full animate-ping" style="background-color: ${pingColor};"></span>
+        <span class="absolute w-6 h-6 rounded-full" style="background-color: ${pulseColor};"></span>
+        <div class="relative w-4 h-4 rounded-full ${coreBg} border-2 border-white shadow-md flex items-center justify-center">
           <div class="w-1.5 h-1.5 rounded-full bg-white"></div>
         </div>
+        ${isOutside ? `
+          <div class="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-red-600 border border-white flex items-center justify-center text-[9px] text-white shadow-xs font-bold leading-none animate-bounce">!</div>
+        ` : ''}
       </div>
     `,
     className: 'live-gps-puck-icon',
@@ -396,32 +405,46 @@ function FloatingMapControls({
   onZoomIn,
   onZoomOut,
   autoFollow,
-  hasLiveGps
+  hasLiveGps,
+  isOutsidePalanan
 }: { 
   onRecenter: () => void;
   onZoomIn: () => void;
   onZoomOut: () => void;
   autoFollow?: boolean;
   hasLiveGps?: boolean;
+  isOutsidePalanan?: boolean;
 }) {
   const darkMode = false;
   return (
     <div className="absolute bottom-72 right-4 flex flex-col gap-2 z-[999]">
-      {/* Current Location / Recenter */}
-      <button 
-        onClick={onRecenter}
-        id="btn-recenter-map"
-        className={`p-3 rounded-full shadow-lg border transition-all active:scale-95 flex items-center justify-center w-11 h-11 ${
-          autoFollow 
-            ? 'bg-blue-600 border-blue-500 text-white shadow-blue-500/30' 
-            : darkMode 
-              ? 'bg-slate-900 border-slate-800 text-blue-400 hover:bg-slate-800' 
-              : 'bg-white border-slate-200 text-blue-600 hover:bg-slate-50'
-        }`}
-        title={autoFollow ? "Auto-following location (Click to center)" : "Find Me & Center Location"}
-      >
-        <Compass className={`w-5 h-5 ${hasLiveGps ? 'animate-pulse' : ''} ${autoFollow ? 'text-white' : (darkMode ? 'text-blue-400' : 'text-blue-600')}`} />
-      </button>
+      {/* Current Location / Recenter with Outside Palanan Warning Indicator */}
+      <div className="relative">
+        <button 
+          onClick={onRecenter}
+          id="btn-recenter-map"
+          className={`p-3 rounded-full shadow-lg border transition-all active:scale-95 flex items-center justify-center w-11 h-11 cursor-pointer ${
+            isOutsidePalanan
+              ? 'bg-red-600 border-red-500 text-white shadow-red-500/40 ring-4 ring-red-400/40 animate-pulse'
+              : autoFollow 
+                ? 'bg-blue-600 border-blue-500 text-white shadow-blue-500/30' 
+                : darkMode 
+                  ? 'bg-slate-900 border-slate-800 text-blue-400 hover:bg-slate-800' 
+                  : 'bg-white border-slate-200 text-blue-600 hover:bg-slate-50'
+          }`}
+          title={isOutsidePalanan ? "You are outside Barangay Palanan (Click to view notice)" : autoFollow ? "Auto-following location (Click to center)" : "Find Me & Center Location"}
+        >
+          <Compass className={`w-5 h-5 ${hasLiveGps ? 'animate-pulse' : ''} text-white`} />
+        </button>
+        {isOutsidePalanan && (
+          <span 
+            className="absolute -top-1.5 -right-1.5 w-5 h-5 rounded-full bg-red-600 border-2 border-white flex items-center justify-center text-[10px] font-black text-white shadow-md animate-bounce"
+            title="Outside Barangay Palanan"
+          >
+            !
+          </span>
+        )}
+      </div>
 
       {/* Easy Zoom In/Out */}
       <div className={`rounded-full shadow-lg border p-0.5 flex flex-col items-center ${
@@ -768,6 +791,10 @@ export default function MapPage() {
         setLiveGpsSpeed(speed);
       }
 
+      // Check whether real-time GPS location is inside Barangay Palanan
+      const insidePalanan = isInsidePalanan(lat, lng);
+      setIsUserOutsidePalanan(!insidePalanan);
+
       // Automatically center map on user on first GPS signal arrival or if autoFollowGps is active
       if ((!hasInitiallyCentered.current || autoFollowGps) && mapRef.current) {
         hasInitiallyCentered.current = true;
@@ -863,6 +890,10 @@ export default function MapPage() {
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
+  // Real-time Palanan boundary states for GPS location
+  const [isUserOutsidePalanan, setIsUserOutsidePalanan] = useState(false);
+  const [showOutsidePalananPopup, setShowOutsidePalananPopup] = useState(false);
+
   // Auto-dismiss toast after 4.5s
   useEffect(() => {
     if (toastMessage) {
@@ -928,6 +959,9 @@ export default function MapPage() {
   // One-time database cleanup to remove generated default danger zones and school/hospital/office saved places
   useEffect(() => {
     const performCleanup = async () => {
+      // In DEMO_MODE, do not modify or delete official danger zones or saved records
+      if (DEMO_MODE) return;
+
       try {
         // 1. Clean up default danger zones (where addedBy === 'admin')
         const qZones = collection(db, 'danger_zones');
@@ -1809,6 +1843,11 @@ export default function MapPage() {
         return s;
       }));
 
+      // In DEMO_MODE, the upvote is reflected locally in React state for demo, but database is not modified
+      if (DEMO_MODE) {
+        return;
+      }
+
       if (db) {
         try {
           const current = communitySpots.find(s => s.id === spotId);
@@ -1864,6 +1903,12 @@ export default function MapPage() {
   const handleCreateCommunitySpot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!spotTitle.trim() || !spotCoords) return;
+
+    if (DEMO_MODE) {
+      setToastMessage('⚠️ Demo Mode: Adding community spots is disabled to prevent test data creation.');
+      setIsAddSpotModalOpen(false);
+      return;
+    }
 
     try {
       const payload = {
@@ -1972,7 +2017,17 @@ export default function MapPage() {
         calculateSafeDirections(gpsCoords, endPoint);
       }
 
-      setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
+      // Check whether user's real-time GPS coordinate is inside Barangay Palanan
+      const insidePalanan = isInsidePalanan(pos.latitude, pos.longitude);
+      setIsUserOutsidePalanan(!insidePalanan);
+
+      if (!insidePalanan) {
+        setShowOutsidePalananPopup(true);
+        setToastMessage("⚠️ You are outside Barangay Palanan.");
+      } else {
+        setShowOutsidePalananPopup(false);
+        setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
+      }
     } catch (err) {
       console.warn("GPS lookup error:", err);
       setToastMessage("⚠️ Unable to acquire GPS lock. Please check your device location settings.");
@@ -2339,13 +2394,25 @@ export default function MapPage() {
           {/* Real-Time Live User GPS Pinpoint & Precision Halo */}
           {liveGpsCoords && !isSimulating && (
             <>
-              <Marker position={liveGpsCoords} icon={createLiveGpsPuckIcon(liveGpsHeading)}>
+              <Marker position={liveGpsCoords} icon={createLiveGpsPuckIcon(liveGpsHeading, isUserOutsidePalanan)}>
                 <Popup>
-                  <div className="text-xs p-1 min-w-[150px]">
-                    <span className="font-bold text-blue-600 flex items-center gap-1.5">
-                      <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping inline-block"></span>
-                      Real-Time GPS Location
-                    </span>
+                  <div className="text-xs p-1 min-w-[170px]">
+                    {isUserOutsidePalanan ? (
+                      <div className="p-2 -m-1 mb-2 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 text-red-700 dark:text-red-300">
+                        <span className="font-black text-xs flex items-center gap-1.5 text-red-600 dark:text-red-400">
+                          <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
+                          Outside Barangay Palanan
+                        </span>
+                        <p className="text-[10px] text-slate-600 dark:text-slate-300 mt-1 font-medium leading-snug">
+                          Your live GPS position is outside Barangay Palanan.
+                        </p>
+                      </div>
+                    ) : (
+                      <span className="font-bold text-blue-600 flex items-center gap-1.5">
+                        <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping inline-block"></span>
+                        Real-Time GPS Location
+                      </span>
+                    )}
                     <p className="text-[10px] text-slate-600 mt-1 font-medium">
                       {liveGpsAccuracy ? `Precision: ±${Math.round(liveGpsAccuracy)} meters` : 'High-precision GPS'}
                     </p>
@@ -2356,7 +2423,7 @@ export default function MapPage() {
                     )}
                     <button
                       onClick={() => setAutoFollowGps(!autoFollowGps)}
-                      className={`mt-2 w-full py-1 px-2 rounded text-[10px] font-bold ${
+                      className={`mt-2 w-full py-1 px-2 rounded text-[10px] font-bold cursor-pointer ${
                         autoFollowGps ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-700'
                       }`}
                     >
@@ -2550,10 +2617,11 @@ export default function MapPage() {
           onZoomOut={handleZoomOut}
           autoFollow={autoFollowGps}
           hasLiveGps={!!liveGpsCoords}
+          isOutsidePalanan={isUserOutsidePalanan}
         />
 
         {/* Circles Risk Legend to sync with Admin Portal */}
-        <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-44 text-left transition-colors duration-300 ${
+        <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-36 text-left transition-colors duration-300 ${
           darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-800'
         }`}>
           <h4 className={`text-[10px] font-black tracking-wider uppercase mb-1.5 pb-1 border-b ${
@@ -2564,18 +2632,57 @@ export default function MapPage() {
           <div className="space-y-1.5">
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#10B981' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Low Risk (50m)</span>
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Low Risk</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#F59E0B' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Moderate (100m)</span>
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Moderate</span>
             </div>
             <div className="flex items-center gap-2">
               <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#F97316' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>High Risk (150m+)</span>
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>High Risk</span>
             </div>
           </div>
         </div>
+
+        {/* Floating Out-of-Palanan Warning Popup like in Report page */}
+        <AnimatePresence>
+          {showOutsidePalananPopup && (
+            <motion.div 
+              initial={{ y: -60, opacity: 0, scale: 0.95 }} 
+              animate={{ y: 0, opacity: 1, scale: 1 }} 
+              exit={{ y: -60, opacity: 0, scale: 0.95 }} 
+              className="absolute top-4 left-4 right-4 z-[1020]"
+            >
+              <div className="bg-red-600/95 backdrop-blur-md text-white p-4 rounded-3xl shadow-2xl flex items-start gap-3 border-2 border-red-400">
+                <AlertCircle className="w-6 h-6 shrink-0 mt-0.5 text-white animate-pulse" />
+                <div className="flex-1 text-left space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-red-200">
+                      Location Warning
+                    </span>
+                    <span className="text-[9px] bg-white/20 px-2.5 py-0.5 rounded-full font-bold uppercase tracking-wider">
+                      Outside Palanan
+                    </span>
+                  </div>
+                  <h4 className="text-sm font-black leading-tight text-white">
+                    You are outside Barangay Palanan.
+                  </h4>
+                  <p className="text-xs font-semibold text-red-100/95 leading-relaxed">
+                    Your real-time GPS location is currently outside Barangay Palanan boundaries. SafeRoute Lite hazard warnings and route safety guidance are centered on Palanan.
+                  </p>
+                </div>
+                <button 
+                  onClick={() => setShowOutsidePalananPopup(false)}
+                  className="p-1.5 rounded-full bg-white/20 hover:bg-white/30 text-white shrink-0 transition cursor-pointer"
+                  title="Close notice"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
 
         {/* Floating live Radar incident Warnings panel */}
         <AnimatePresence>

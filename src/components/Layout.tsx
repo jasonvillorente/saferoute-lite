@@ -2,6 +2,7 @@ import React from 'react';
 import { Outlet, NavLink } from 'react-router-dom';
 import { Home, Map, ShieldAlert, User, Bell } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
+import { DEMO_MODE } from '../config/demo';
 import { cn } from '../lib/utils';
 
 export default function Layout() {
@@ -31,6 +32,12 @@ export default function Layout() {
         )}>
           SafeRoute Lite
         </span>
+        {DEMO_MODE && (
+          <span className="text-[10px] font-black uppercase tracking-wider px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-500 border border-amber-500/30 flex items-center gap-1">
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse" />
+            DEMO MODE
+          </span>
+        )}
       </header>
 
       {/* Main Content Area */}

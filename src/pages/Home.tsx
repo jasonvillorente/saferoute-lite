@@ -6,6 +6,7 @@ import { collection, query, onSnapshot, addDoc, serverTimestamp } from 'firebase
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { DangerZone, safeGetCoords, isZoneResolved } from '../types';
+import { DEMO_MODE } from '../config/demo';
 import { motion } from 'motion/react';
 
 // Helper to robustly resolve danger zone risk level from various fields set by the Admin Portal or app
@@ -208,8 +209,9 @@ export default function Home() {
 
       setSirenInterval(interval);
 
-      // Automatically file a real Firestore alert incident to a dedicated SOS log collection
-      if (user) {
+      // In live mode, file a real Firestore alert incident to a dedicated SOS log collection.
+      // In DEMO_MODE, siren plays for demonstration, but database writing is skipped.
+      if (user && !DEMO_MODE) {
         await addDoc(collection(db, 'sos_alerts'), {
           reporterId: user.uid,
           reporterName: profile?.name || 'Resident',

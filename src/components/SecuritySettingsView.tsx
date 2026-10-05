@@ -29,6 +29,7 @@ import { auth, db } from '../lib/firebase';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { PrivacySettings, SecuritySettings } from '../types';
+import { DEMO_MODE } from '../config/demo';
 import { cn } from '../lib/utils';
 
 interface SecuritySettingsViewProps {
@@ -271,6 +272,12 @@ export default function SecuritySettingsView({ onBack }: SecuritySettingsViewPro
   // Handle Account Deletion
   const handleExecuteDeleteAccount = async () => {
     if (deleteConfirmText.trim().toUpperCase() !== 'DELETE' || !deleteAcknowledged) {
+      return;
+    }
+
+    if (DEMO_MODE) {
+      showToast('⚠️ Demo Mode: Account deletion is disabled.', 'info');
+      setShowDeleteModal(false);
       return;
     }
 
