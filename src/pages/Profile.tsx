@@ -53,6 +53,7 @@ export default function Profile() {
 
   const handleSignOut = async () => {
     localStorage.removeItem('safe_route_guest');
+    localStorage.removeItem('safe_route_registered_user');
     try {
       await auth.signOut();
     } catch (e) {

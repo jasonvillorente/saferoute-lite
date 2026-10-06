@@ -51,6 +51,7 @@ export default function Login() {
       const authResult = await promiseWithTimeout(authPromise, 3800, 'auth-timeout-marker' as any);
 
       if (authResult !== 'auth-timeout-marker' && auth.currentUser) {
+        localStorage.removeItem('safe_route_guest');
         const nameClean = auth.currentUser.displayName || (isEmail ? cleanEmail.split('@')[0] : `Resident (${cleanPhone || rawInput})`);
         await syncResidentToAllCollections(
           auth.currentUser.uid,
@@ -138,7 +139,8 @@ export default function Login() {
             }
           };
 
-          localStorage.setItem('safe_route_guest', JSON.stringify(session));
+          localStorage.removeItem('safe_route_guest');
+          localStorage.setItem('safe_route_registered_user', JSON.stringify(session));
 
           setTimeout(() => {
             navigate('/');
@@ -159,6 +161,7 @@ export default function Login() {
     setLoading(true);
     setError('');
     try {
+      localStorage.removeItem('safe_route_guest');
       const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
       const user = result.user;

@@ -7,7 +7,7 @@ import { useTheme } from '../context/ThemeContext';
 import { syncReportToAllCollections } from '../lib/syncHelper';
 import { getCurrentGpsPosition, requestLocationPermission } from '../lib/nativeLocation';
 import { isInsidePalanan, PALANAN_BOUNDS } from '../lib/palananBounds';
-import { DEMO_MODE } from '../config/demo';
+import { isDemoMode as calculateDemoMode } from '../config/demo';
 import { 
   AlertTriangle, 
   AlertCircle,
@@ -20,7 +20,6 @@ import {
   Compass,
   Map as MapIcon,
   X,
-  Shield,
   ShieldAlert
 } from 'lucide-react';
 
@@ -36,7 +35,7 @@ const reportIcon = L.icon({
   shadowSize: [41, 41]
 });
 
-// A small sub-component to catch map clicks
+// Map click handler sub-component
 function MapEventsHandler({ onSelect }: { onSelect: (lat: number, lng: number) => void }) {
   useMapEvents({
     click(e) {
@@ -46,12 +45,12 @@ function MapEventsHandler({ onSelect }: { onSelect: (lat: number, lng: number) =
   return null;
 }
 
-// Sub-component to ensure map pans smoothly when user location changes
+// Pan map smoothly when location changes
 function MapViewUpdater({ center }: { center: [number, number] }) {
   const map = useMap();
   useEffect(() => {
     if (map && center) {
-      map.setView(center, map.getZoom());
+      map.setView(center, map.getZoom() || 15);
     }
   }, [center[0], center[1], map]);
   return null;
@@ -59,14 +58,14 @@ function MapViewUpdater({ center }: { center: [number, number] }) {
 
 export default function Report() {
   const [description, setDescription] = useState('');
-  const { user, profile } = useAuth();
+  const { user, profile, isDemoMode: authIsDemoMode } = useAuth();
+  const isDemo = authIsDemoMode ?? calculateDemoMode(user, profile);
   const { darkMode } = useTheme();
   const navigate = useNavigate();
 
-  // Feature states - location starts as null (no assumed/default Palanan coordinate)
+  // Feature states
   const [loading, setLoading] = useState(false);
   const [success, setSuccess] = useState(false);
-  const [showMap, setShowMap] = useState(false);
   const [location, setLocation] = useState<{ lat: number; lng: number } | null>(null);
   const [locationAccuracy, setLocationAccuracy] = useState<number | null>(null);
   const [locationName, setLocationName] = useState('');
@@ -77,9 +76,13 @@ export default function Report() {
   const [locationError, setLocationError] = useState<string | null>(null);
   const [showDemoModal, setShowDemoModal] = useState(false);
 
+  // References
+  const descriptionInputRef = useRef<HTMLTextAreaElement>(null);
+  const mapSectionRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
   // Image states
   const [imageUrl, setImageUrl] = useState('');
-  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const getCategoryFromText = (text: string): string => {
     const norm = text.toLowerCase();
@@ -123,31 +126,28 @@ export default function Report() {
         setLocationError(null);
       }
 
-      setShowMap(true);
       setTimeout(() => {
         window.dispatchEvent(new Event('resize'));
       }, 150);
     } catch (error) {
       console.warn('Geolocation failed:', error);
-      // GPS cannot be obtained:
-      // Show:
-      // "Unable to get your current location."
-      // "Please enable location services and try again."
-      // Do NOT use a fake/default Palanan coordinate.
       setIsOutsidePalananState(false);
       setLocationError(
-        'Unable to get your current location. Please enable location services and try again.'
+        'Unable to get your current location. Please enable location services or tap on the map within Barangay Palanan to pin the hazard.'
       );
-      // Do NOT set location or show map with a fake Palanan marker
     } finally {
       setGeolocationLoading(false);
     }
   };
 
   // Handle map selection / marker drag events
-  const handleMapSelect = (lat: number, lng: number) => {
-    // Preserve the exact selected location
+  const handleMapSelect = (lat: number, lng: number, landmark?: string) => {
     setLocation({ lat, lng });
+    setLocationAccuracy(null);
+    if (landmark) {
+      setLocationName(landmark);
+    }
+
     const inside = isInsidePalanan(lat, lng);
     if (!inside) {
       setIsOutsidePalananState(true);
@@ -214,28 +214,33 @@ export default function Report() {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user) return;
 
+    // 1. Check if location is pinned
     if (!location) {
-      setLocationError('Please pin your location before submitting.');
+      setLocationError('Please pin your location before submitting. Tapping "Pin Location" now...');
+      mapSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
+      handleGetLocation();
       return;
     }
 
-    // FINAL FIREBASE VALIDATION
-    // Perform one final check: isInsidePalanan(latitude, longitude)
-    // If it returns false:
-    // STOP SUBMISSION -> SHOW ERROR -> DO NOT WRITE REPORT TO FIREBASE
+    // 2. Final boundary check
     if (!isInsidePalanan(location.lat, location.lng)) {
       setIsOutsidePalananState(true);
       setLocationError(
         'You are outside Barangay Palanan. You must be within Barangay Palanan to submit a danger report.'
       );
+      mapSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
       return;
     }
 
-    // DEMO MODE RESTRICTION:
-    // Prevent danger report document from being created in Firebase to avoid false or test reports.
-    if (DEMO_MODE) {
+    // 3. Check if description is present
+    if (!description.trim()) {
+      descriptionInputRef.current?.focus();
+      return;
+    }
+
+    // 4. Demo Mode Check (Only blocks the explicit Guest Demo account)
+    if (isDemo) {
       setShowDemoModal(true);
       return;
     }
@@ -244,12 +249,13 @@ export default function Report() {
     try {
       const category = getCategoryFromText(description);
       
-      const reporterFullName = profile?.name || user.displayName || 'Resident';
-      const reporterContact = user.phoneNumber || profile?.phoneNumber || user.email || profile?.email || 'resident@saferoute.local';
+      const currentUid = user?.uid || profile?.uid || 'resident-anon';
+      const reporterFullName = profile?.name || user?.displayName || 'Resident';
+      const reporterContact = user?.phoneNumber || profile?.phoneNumber || user?.email || profile?.email || 'resident@saferoute.local';
 
-      // Submit synced report to all database collections using ACTUAL GPS coordinates
+      // Submit synced report to all database collections using ACTUAL coordinates
       await syncReportToAllCollections({
-        reporterId: user.uid,
+        reporterId: currentUid,
         reporterName: reporterFullName,
         reporterEmail: reporterContact,
         description,
@@ -274,10 +280,12 @@ export default function Report() {
     return (
       <div className="h-[75vh] flex flex-col items-center justify-center text-center p-6 animate-in fade-in duration-300">
         <div className={`p-6 rounded-full mb-6 animate-bounce ${darkMode ? 'bg-green-950/45' : 'bg-green-100'}`}>
-          <Check className="w-12 h-12 text-green-550" />
+          <Check className="w-12 h-12 text-green-500" />
         </div>
         <h2 className={`text-2xl font-bold mb-2 ${darkMode ? 'text-white' : 'text-slate-900'}`}>Report Submitted!</h2>
-        <p className={`max-w-sm text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Barangay officials will verify your report shortly. Thank you for keeping us safe.</p>
+        <p className={`max-w-sm text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
+          Barangay officials will verify your report shortly. Thank you for keeping our community safe.
+        </p>
       </div>
     );
   }
@@ -290,7 +298,7 @@ export default function Report() {
             <AlertTriangle className="w-6 h-6 text-amber-500" />
             <span>Report Hazard</span>
           </h1>
-          {DEMO_MODE && (
+          {isDemo && (
             <span className="text-[10px] font-black uppercase tracking-wider px-2.5 py-0.5 rounded-full bg-amber-500/15 text-amber-500 border border-amber-500/30">
               Demo Mode
             </span>
@@ -302,12 +310,15 @@ export default function Report() {
       <form onSubmit={handleSubmit} className="space-y-6">
         <div className="space-y-4">
           <label className="block">
-            <span className={`text-sm font-bold block mb-2 uppercase tracking-wide ${darkMode ? 'text-slate-350' : 'text-slate-700'}`}>Tell us what happened</span>
+            <span className={`text-sm font-bold block mb-2 uppercase tracking-wide ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>
+              Tell us what happened
+            </span>
             <textarea
+              ref={descriptionInputRef}
               value={description}
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Describe the unsafe situation (e.g., suspicious activity, water-logged flood risk, construction obstacles, faulty street lamps)"
-              className={`w-full border rounded-3xl p-4 min-h-[140px] focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium border-solid shadow-sm ${
+              className={`w-full border rounded-3xl p-4 min-h-[130px] focus:outline-none focus:ring-2 focus:ring-blue-500 transition-all font-medium border-solid shadow-sm ${
                 darkMode 
                   ? 'bg-slate-900 border-slate-800 text-white placeholder:text-slate-500' 
                   : 'bg-white border-slate-200 text-slate-900 placeholder:text-slate-400'
@@ -336,16 +347,16 @@ export default function Report() {
                   ? (darkMode ? 'bg-indigo-950/40 border-indigo-900/50 text-indigo-400' : 'bg-indigo-50 border-indigo-200 text-indigo-700') 
                   : isOutsidePalananState
                   ? (darkMode ? 'bg-red-950/40 border-red-900/50 text-red-400' : 'bg-red-50 border-red-200 text-red-700')
-                  : (darkMode ? 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800' : 'bg-slate-100 border-slate-100 hover:bg-slate-200 text-slate-700')
+                  : (darkMode ? 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800' : 'bg-slate-100 border-slate-200 hover:bg-slate-200 text-slate-700')
               }`}
             >
               {geolocationLoading ? (
-                <Loader2 className="w-5 h-5 animate-spin" />
+                <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
               ) : (
-                <Compass className="w-5 h-5" />
+                <Compass className="w-5 h-5 text-blue-600" />
               )}
               <span className="text-[10px] font-bold uppercase tracking-wider">
-                {location && !isOutsidePalananState ? 'Location Pinned' : isOutsidePalananState ? 'Outside Palanan' : 'Pin Location'}
+                {geolocationLoading ? 'Acquiring GPS...' : location && !isOutsidePalananState ? 'GPS Location Pinned' : isOutsidePalananState ? 'Outside Palanan' : 'Pin Location'}
               </span>
             </button>
             
@@ -355,10 +366,10 @@ export default function Report() {
               className={`p-4 rounded-3xl flex flex-col items-center justify-center gap-2 active:scale-95 transition-all shadow-sm border font-semibold cursor-pointer ${
                 imageUrl 
                   ? (darkMode ? 'bg-emerald-950/40 border-emerald-900/50 text-emerald-400' : 'bg-emerald-50 border-emerald-200 text-emerald-700') 
-                  : (darkMode ? 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800' : 'bg-slate-100 border-slate-100 hover:bg-slate-200 text-slate-700')
+                  : (darkMode ? 'bg-slate-900 border-slate-800 text-slate-300 hover:bg-slate-800' : 'bg-slate-100 border-slate-200 hover:bg-slate-200 text-slate-700')
               }`}
             >
-              <Camera className="w-5 h-5" />
+              <Camera className="w-5 h-5 text-slate-600 dark:text-slate-300" />
               <span className="text-[10px] font-bold uppercase tracking-wider">
                 {imageUrl ? 'Photo Added' : 'Add Photo'}
               </span>
@@ -371,11 +382,11 @@ export default function Report() {
               darkMode ? 'bg-red-950/40 border-red-900/60 text-red-200' : 'bg-red-50 border-red-200 text-red-900'
             }`}>
               <AlertCircle className="w-5 h-5 text-red-500 shrink-0 mt-0.5" />
-              <div className="space-y-1 text-xs">
+              <div className="space-y-1 text-xs text-left">
                 <p className="font-bold text-sm text-red-600 dark:text-red-400">
                   You are outside Barangay Palanan.
                 </p>
-                <p className="font-medium text-slate-700 dark:text-slate-300">
+                <p className="font-medium text-slate-700 dark:text-slate-300 leading-relaxed">
                   You must be within Barangay Palanan to submit a danger report.
                 </p>
               </div>
@@ -388,12 +399,12 @@ export default function Report() {
               darkMode ? 'bg-amber-950/30 border-amber-900/50 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-900'
             }`}>
               <AlertTriangle className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" />
-              <div className="space-y-1 text-xs">
+              <div className="space-y-1 text-xs text-left">
                 <p className="font-bold text-sm text-amber-600 dark:text-amber-400">
                   Unable to get your current location.
                 </p>
-                <p className="font-medium text-slate-700 dark:text-slate-300">
-                  Please enable location services and try again.
+                <p className="font-medium text-slate-700 dark:text-slate-300 leading-relaxed">
+                  Please enable location services or tap on the map within Barangay Palanan below to pin the location.
                 </p>
               </div>
             </div>
@@ -421,7 +432,7 @@ export default function Report() {
                 type="button" 
                 onClick={handleRemovePhoto}
                 className={`p-2.5 rounded-2xl transition-all cursor-pointer ${
-                  darkMode ? 'bg-red-950/40 text-red-400 hover:bg-red-950/70' : 'bg-red-50 text-red-650 hover:bg-red-100'
+                  darkMode ? 'bg-red-950/40 text-red-400 hover:bg-red-950/70' : 'bg-red-50 text-red-600 hover:bg-red-100'
                 }`}
                 title="Remove photo"
               >
@@ -430,26 +441,26 @@ export default function Report() {
             </div>
           )}
 
-          {/* Map Selector Container - Renders only when valid coordinates exist */}
-          {showMap && location && (
-            <div className={`space-y-3 p-4 border rounded-3xl shadow-inner animate-fade-in ${
-              darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-100'
+          {/* Pinned Location Map Preview - Only appears when location is pinpointed */}
+          {location && (
+            <div ref={mapSectionRef} className={`space-y-3 p-4 border rounded-3xl shadow-sm animate-in fade-in duration-200 ${
+              darkMode ? 'bg-slate-900 border-slate-800' : 'bg-slate-50 border-slate-200'
             }`}>
               <div className="flex items-center justify-between">
                 <div className="flex items-center gap-2">
-                  <MapIcon className={`w-4 h-4 ${isOutsidePalananState ? 'text-red-500' : 'text-indigo-500'}`} />
+                  <MapIcon className={`w-4 h-4 ${isOutsidePalananState ? 'text-red-500' : 'text-blue-500'}`} />
                   <span className={`text-xs font-bold uppercase tracking-wider ${
                     isOutsidePalananState 
                       ? (darkMode ? 'text-red-400' : 'text-red-600') 
-                      : (darkMode ? 'text-slate-300' : 'text-slate-800')
+                      : (darkMode ? 'text-blue-400' : 'text-blue-600')
                   }`}>
-                    {isOutsidePalananState ? 'Location Outside Palanan' : 'Drag to specify location'}
+                    {isOutsidePalananState ? 'Location Outside Palanan' : 'Hazard Location Pinned'}
                   </span>
                 </div>
                 <div className={`text-[10px] font-mono font-semibold px-2.5 py-0.5 rounded-full ${
                   isOutsidePalananState
                     ? (darkMode ? 'bg-red-950/60 text-red-300 border border-red-900/60' : 'bg-red-100 text-red-800 border border-red-200')
-                    : (darkMode ? 'bg-indigo-950/50 text-indigo-400' : 'bg-indigo-100 text-indigo-800')
+                    : (darkMode ? 'bg-blue-950/50 text-blue-400 border border-blue-900/50' : 'bg-blue-100 text-blue-800 border border-blue-200')
                 }`}>
                   {location.lat.toFixed(5)}, {location.lng.toFixed(5)}
                 </div>
@@ -461,15 +472,15 @@ export default function Report() {
                 </div>
               )}
 
-              {/* Leaflet Map Picker - displays user's ACTUAL GPS coordinates */}
-              <div className={`h-56 relative w-full rounded-2xl overflow-hidden border shadow-sm z-10 ${
+              {/* Interactive Leaflet Map Picker */}
+              <div className={`h-60 relative w-full rounded-2xl overflow-hidden border shadow-sm z-10 ${
                 isOutsidePalananState 
                   ? (darkMode ? 'border-red-900/60' : 'border-red-300') 
-                  : (darkMode ? 'border-slate-800' : 'border-slate-200')
+                  : (darkMode ? 'border-blue-900/60' : 'border-blue-300')
               }`}>
                 <MapContainer 
                   center={[location.lat, location.lng]} 
-                  zoom={15} 
+                  zoom={16} 
                   className="w-full h-full"
                   scrollWheelZoom={false}
                 >
@@ -484,11 +495,11 @@ export default function Report() {
                   <Rectangle 
                     bounds={PALANAN_BOUNDS}
                     pathOptions={{
-                      color: isOutsidePalananState ? '#ef4444' : '#3b82f6',
+                      color: isOutsidePalananState ? '#ef4444' : '#2563eb',
                       weight: 2,
                       dashArray: '5, 5',
-                      fillColor: '#3b82f6',
-                      fillOpacity: 0.05
+                      fillColor: '#2563eb',
+                      fillOpacity: 0.06
                     }}
                   />
 
@@ -508,14 +519,16 @@ export default function Report() {
                 </MapContainer>
               </div>
 
-              <div className="space-y-1">
-                <span className={`text-[11px] font-bold block uppercase tracking-wide ${darkMode ? 'text-slate-400' : 'text-slate-700'}`}>Landmark name or Street address</span>
+              <div className="space-y-1 pt-1">
+                <span className={`text-[11px] font-bold block uppercase tracking-wide ${darkMode ? 'text-slate-400' : 'text-slate-700'}`}>
+                  Landmark name or Street address
+                </span>
                 <input 
                   type="text" 
                   value={locationName}
                   onChange={(e) => setLocationName(e.target.value)}
                   placeholder="e.g. Tramo St. corner Sandejas, near store"
-                  className={`w-full border rounded-2xl px-4 py-2.5 text-xs focus:outline-none focus:ring-1 focus:ring-indigo-500 font-medium border-solid ${
+                  className={`w-full border rounded-2xl px-4 py-2.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-500 font-medium border-solid ${
                     darkMode 
                       ? 'bg-slate-950 border-slate-800 text-white placeholder:text-slate-500' 
                       : 'bg-white border-slate-200 text-slate-900 placeholder:text-slate-400'
@@ -535,33 +548,48 @@ export default function Report() {
           </p>
         </div>
 
+        {/* Dynamic & Interactive Submission Button */}
         <button
           type="submit"
-          disabled={loading || !description || isOutsidePalananState || !location}
-          className={`w-full font-bold py-5 rounded-3xl shadow-xl active:scale-[0.98] transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2 cursor-pointer ${
-            isOutsidePalananState
-              ? 'bg-red-600/70 text-white cursor-not-allowed shadow-none'
+          disabled={loading}
+          className={`w-full font-bold py-5 rounded-3xl shadow-xl active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer ${
+            loading
+              ? 'opacity-60 cursor-not-allowed bg-slate-700 text-white'
+              : isOutsidePalananState
+              ? 'bg-red-600 hover:bg-red-700 text-white shadow-red-200 dark:shadow-none'
+              : !location
+              ? 'bg-blue-600 hover:bg-blue-700 text-white shadow-blue-200 dark:shadow-none'
+              : !description.trim()
+              ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-amber-200 dark:shadow-none'
               : darkMode 
               ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-slate-950/40' 
-              : 'bg-slate-900 text-white hover:bg-slate-800 shadow-slate-200'
+              : 'bg-slate-900 text-white hover:bg-slate-800 shadow-slate-300'
           }`}
         >
           {loading ? (
-            <Loader2 className="w-5 h-5 animate-spin" />
+            <>
+              <Loader2 className="w-5 h-5 animate-spin" />
+              <span>Submitting Report...</span>
+            </>
           ) : isOutsidePalananState ? (
             <>
               <AlertCircle className="w-5 h-5 text-white" />
-              Submission Blocked (Outside Palanan)
+              <span>Blocked (Location Outside Palanan)</span>
             </>
           ) : !location ? (
             <>
               <MapPin className="w-5 h-5" />
-              Pin Location Required to Submit
+              <span>Pin Location to Submit</span>
+            </>
+          ) : !description.trim() ? (
+            <>
+              <AlertTriangle className="w-5 h-5" />
+              <span>Please Describe Hazard to Submit</span>
             </>
           ) : (
             <>
               <AlertTriangle className="w-5 h-5" />
-              Submit Report
+              <span>Submit Hazard Report</span>
             </>
           )}
         </button>

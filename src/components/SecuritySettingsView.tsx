@@ -29,7 +29,7 @@ import { auth, db } from '../lib/firebase';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { PrivacySettings, SecuritySettings } from '../types';
-import { DEMO_MODE } from '../config/demo';
+import { isDemoMode as checkDemoMode } from '../config/demo';
 import { cn } from '../lib/utils';
 
 interface SecuritySettingsViewProps {
@@ -39,7 +39,8 @@ interface SecuritySettingsViewProps {
 type SecurityTab = 'menu' | 'password' | 'privacy' | 'login_security' | 'delete_account';
 
 export default function SecuritySettingsView({ onBack }: SecuritySettingsViewProps) {
-  const { user, profile } = useAuth();
+  const { user, profile, isDemoMode: authIsDemoMode } = useAuth();
+  const isDemo = authIsDemoMode ?? checkDemoMode(user, profile);
   const { darkMode } = useTheme();
 
   const [activeTab, setActiveTab] = useState<SecurityTab>('menu');
@@ -275,7 +276,7 @@ export default function SecuritySettingsView({ onBack }: SecuritySettingsViewPro
       return;
     }
 
-    if (DEMO_MODE) {
+    if (isDemo) {
       showToast('⚠️ Demo Mode: Account deletion is disabled.', 'info');
       setShowDeleteModal(false);
       return;

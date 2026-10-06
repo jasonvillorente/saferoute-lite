@@ -6,7 +6,7 @@ import { collection, query, onSnapshot, addDoc, serverTimestamp } from 'firebase
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { DangerZone, safeGetCoords, isZoneResolved } from '../types';
-import { DEMO_MODE } from '../config/demo';
+import { isDemoMode as checkDemoMode } from '../config/demo';
 import { motion } from 'motion/react';
 
 // Helper to robustly resolve danger zone risk level from various fields set by the Admin Portal or app
@@ -49,7 +49,8 @@ function resolveRiskLevel(zone: any): 'low' | 'moderate' | 'high' | 'critical' {
 }
 
 export default function Home() {
-  const { profile, user } = useAuth();
+  const { profile, user, isDemoMode: authIsDemoMode } = useAuth();
+  const isDemo = authIsDemoMode ?? checkDemoMode(user, profile);
   const { darkMode, toggleDarkMode } = useTheme();
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [routeHistory, setRouteHistory] = useState<{ start: string; end: string; safety: string; time: string }[]>([]);
@@ -210,8 +211,8 @@ export default function Home() {
       setSirenInterval(interval);
 
       // In live mode, file a real Firestore alert incident to a dedicated SOS log collection.
-      // In DEMO_MODE, siren plays for demonstration, but database writing is skipped.
-      if (user && !DEMO_MODE) {
+      // In Demo Mode (Guest), siren plays for demonstration, but database writing is skipped.
+      if (user && !isDemo) {
         await addDoc(collection(db, 'sos_alerts'), {
           reporterId: user.uid,
           reporterName: profile?.name || 'Resident',

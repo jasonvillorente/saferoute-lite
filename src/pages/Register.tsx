@@ -120,7 +120,8 @@ export default function Register() {
         }
       };
 
-      localStorage.setItem('safe_route_guest', JSON.stringify(session));
+      localStorage.removeItem('safe_route_guest');
+      localStorage.setItem('safe_route_registered_user', JSON.stringify(session));
       setSuccessInfo('Account created successfully! Entering SafeRoute...');
 
       setTimeout(() => {
@@ -139,6 +140,7 @@ export default function Register() {
     setLoading(true);
     setError('');
     try {
+      localStorage.removeItem('safe_route_guest');
       const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
       const user = result.user;

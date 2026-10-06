@@ -6,7 +6,7 @@ import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { useAuth } from '../context/AuthContext';
 import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords, CommunitySpot, CommunitySpotCategory, isZoneResolved } from '../types';
-import { DEMO_MODE } from '../config/demo';
+import { isDemoMode as checkDemoMode } from '../config/demo';
 import { isInsidePalanan } from '../lib/palananBounds';
 import { 
   checkLocationPermission, 
@@ -850,7 +850,8 @@ export default function MapPage() {
   const [isSheetExpanded, setIsSheetExpanded] = useState(false);
 
   // User auth details
-  const { user, isAdmin, toggleUserRole } = useAuth();
+  const { user, profile, isAdmin, isDemoMode: authIsDemoMode, toggleUserRole } = useAuth();
+  const isDemo = authIsDemoMode ?? checkDemoMode(user, profile);
   
   // Saved Places state structures
   const [savedPlaces, setSavedPlaces] = useState<SavedPlace[]>([]);
@@ -959,8 +960,8 @@ export default function MapPage() {
   // One-time database cleanup to remove generated default danger zones and school/hospital/office saved places
   useEffect(() => {
     const performCleanup = async () => {
-      // In DEMO_MODE, do not modify or delete official danger zones or saved records
-      if (DEMO_MODE) return;
+      // In Demo Mode (Guest), do not modify or delete official danger zones or saved records
+      if (isDemo) return;
 
       try {
         // 1. Clean up default danger zones (where addedBy === 'admin')
@@ -1843,8 +1844,8 @@ export default function MapPage() {
         return s;
       }));
 
-      // In DEMO_MODE, the upvote is reflected locally in React state for demo, but database is not modified
-      if (DEMO_MODE) {
+      // In Demo Mode (Guest), the upvote is reflected locally in React state for demo, but database is not modified
+      if (isDemo) {
         return;
       }
 
@@ -1904,7 +1905,7 @@ export default function MapPage() {
     e.preventDefault();
     if (!spotTitle.trim() || !spotCoords) return;
 
-    if (DEMO_MODE) {
+    if (isDemo) {
       setToastMessage('⚠️ Demo Mode: Adding community spots is disabled to prevent test data creation.');
       setIsAddSpotModalOpen(false);
       return;
