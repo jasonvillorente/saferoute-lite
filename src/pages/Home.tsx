@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, MapPin, AlertTriangle, CheckCircle2, Phone, Volume2, VolumeX, Moon, Sun, History, ShieldAlert } from 'lucide-react';
+import { Shield, MapPin, AlertTriangle, CheckCircle2, Phone, Moon, Sun, History, ShieldAlert } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
-import { collection, query, onSnapshot, addDoc, serverTimestamp } from 'firebase/firestore';
+import { collection, query, onSnapshot } from 'firebase/firestore';
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { DangerZone, safeGetCoords, isZoneResolved } from '../types';
@@ -55,14 +55,7 @@ export default function Home() {
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [routeHistory, setRouteHistory] = useState<{ start: string; end: string; safety: string; time: string }[]>([]);
   const [permissionError, setPermissionError] = useState(false);
-  
-  // SOS States
-  const [isSOSActive, setIsSOSActive] = useState(false);
-  const [audioContext, setAudioContext] = useState<AudioContext | null>(null);
-  const [sirenInterval, setSirenInterval] = useState<NodeJS.Timeout | null>(null);
-  const [oscillator1, setOscillator1] = useState<OscillatorNode | null>(null);
-  const [oscillator2, setOscillator2] = useState<OscillatorNode | null>(null);
-  
+
   // Emergency Hotlines list (Ahon Palanan Mobile Contacts)
   const hotlines = [
     { name: 'Barangay Police (24/7)', phone: '0917-139-7288' },
@@ -155,95 +148,6 @@ export default function Home() {
     };
   }, []);
 
-  // Safe synthesized siren audio for emergency scenarios using standard web-audio oscillator
-  const triggerSOS = async () => {
-    if (isSOSActive) {
-      // Deactivate siren
-      if (sirenInterval) clearInterval(sirenInterval);
-      if (oscillator1) { try { oscillator1.stop(); } catch(e){} }
-      if (oscillator2) { try { oscillator2.stop(); } catch(e){} }
-      setIsSOSActive(false);
-      return;
-    }
-
-    setIsSOSActive(true);
-
-    try {
-      // Initialize Audio Context Web API block
-      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
-      setAudioContext(ctx);
-
-      const osc1 = ctx.createOscillator();
-      const osc2 = ctx.createOscillator();
-      const gainNode = ctx.createGain();
-
-      osc1.type = 'sawtooth';
-      osc2.type = 'sine';
-
-      // Alternating ambulance frequencies
-      osc1.frequency.setValueAtTime(320, ctx.currentTime);
-      osc2.frequency.setValueAtTime(440, ctx.currentTime);
-
-      gainNode.gain.setValueAtTime(0.08, ctx.currentTime); // Low safe buzzer sound
-
-      osc1.connect(gainNode);
-      osc2.connect(gainNode);
-      gainNode.connect(ctx.destination);
-
-      osc1.start();
-      osc2.start();
-
-      setOscillator1(osc1);
-      setOscillator2(osc2);
-
-      let toggleSirenFreq = true;
-      const interval = setInterval(() => {
-        if (toggleSirenFreq) {
-          osc1.frequency.linearRampToValueAtTime(450, ctx.currentTime + 0.4);
-          osc1.frequency.linearRampToValueAtTime(350, ctx.currentTime + 0.8);
-        } else {
-          osc1.frequency.linearRampToValueAtTime(600, ctx.currentTime + 0.4);
-          osc1.frequency.linearRampToValueAtTime(400, ctx.currentTime + 0.8);
-        }
-        toggleSirenFreq = !toggleSirenFreq;
-      }, 800);
-
-      setSirenInterval(interval);
-
-      // In live mode, file a real Firestore alert incident to a dedicated SOS log collection.
-      // In Demo Mode (Guest), siren plays for demonstration, but database writing is skipped.
-      if (user && !isDemo) {
-        await addDoc(collection(db, 'sos_alerts'), {
-          reporterId: user.uid,
-          reporterName: profile?.name || 'Resident',
-          reporterEmail: user.email || profile?.email || 'resident@saferoute.local',
-          description: `🚨 EMERGENCY SOS triggered by resident ${profile?.name || 'Resident'}! Active distress alert beacon.`,
-          location: { lat: 14.56038, lng: 120.99800 },
-          createdAt: serverTimestamp()
-        });
-
-        // Add user-specific notification
-        await addDoc(collection(db, 'notifications'), {
-          userId: user.uid,
-          message: 'Distress SOS beacon successfully broadcasted. Nearby residents have been notified.',
-          type: 'alert',
-          read: false,
-          createdAt: serverTimestamp()
-        });
-      }
-
-    } catch (err) {
-      console.error('Audio initialization failed:', err);
-    }
-  };
-
-  useEffect(() => {
-    return () => {
-      if (sirenInterval) clearInterval(sirenInterval);
-      if (oscillator1) { try { oscillator1.stop(); } catch(e){} }
-      if (oscillator2) { try { oscillator2.stop(); } catch(e){} }
-    };
-  }, [sirenInterval, oscillator1, oscillator2]);
 
   // Dynamic route risk score metrics strictly from Danger Zones
   const activeZones = zones.filter(z => z.active);
@@ -326,30 +230,6 @@ export default function Home() {
         <Shield className="absolute -right-4 -bottom-4 w-36 h-36 text-white/5 rotate-12" />
       </motion.div>
 
-      {/* SOS Distress Button */}
-      <div className={`p-5 rounded-3xl border transition-all ${
-        darkMode ? 'bg-slate-900/50 border-slate-800' : 'bg-white border-slate-100 shadow-sm'
-      }`}>
-        <div className="flex items-center justify-between gap-4 mb-4">
-          <div>
-            <h3 className={`font-black text-sm uppercase tracking-wide ${darkMode ? 'text-white' : 'text-slate-900'}`}>Instant SOS Beacon</h3>
-            <p className="text-xs text-slate-400">Triggers loud audio buzzer & logs alert location instantly to Firestore.</p>
-          </div>
-          <div className={`w-3 h-3 rounded-full ${isSOSActive ? 'bg-red-500 animate-ping' : 'bg-slate-300'}`} />
-        </div>
-        
-        <button 
-          onClick={triggerSOS}
-          className={`w-full font-black py-4 rounded-2xl transition-all shadow-lg text-sm flex items-center justify-center gap-2 active:scale-95 ${
-            isSOSActive 
-              ? 'bg-rose-600 text-white animate-pulse shadow-rose-300/40' 
-              : 'bg-red-500 text-white shadow-red-300/40 hover:bg-red-600'
-          }`}
-        >
-          {isSOSActive ? <VolumeX className="w-5 h-5" /> : <Volume2 className="w-5 h-5" />}
-          {isSOSActive ? 'DEACTIVATE EMERGENCY SIREN' : 'TRIGGER EMERGENCY SOS'}
-        </button>
-      </div>
 
       {/* Safety Statistics Grid */}
       <div className="grid grid-cols-2 gap-4">

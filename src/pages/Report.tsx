@@ -20,7 +20,8 @@ import {
   Compass,
   Map as MapIcon,
   X,
-  ShieldAlert
+  ShieldAlert,
+  Lock
 } from 'lucide-react';
 
 // Leaflet markers shadow url
@@ -215,7 +216,14 @@ export default function Report() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
-    // 1. Check if location is pinned
+    // 1. Registered Resident Check (First Priority)
+    // Demo / Guest mode users are strictly forbidden from submitting danger reports
+    if (isDemo || !user || user.isAnonymous || user.isGuest || profile?.isGuest) {
+      setShowDemoModal(true);
+      return;
+    }
+
+    // 2. Check if location is pinned
     if (!location) {
       setLocationError('Please pin your location before submitting. Tapping "Pin Location" now...');
       mapSectionRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -223,7 +231,7 @@ export default function Report() {
       return;
     }
 
-    // 2. Final boundary check
+    // 3. Final boundary check
     if (!isInsidePalanan(location.lat, location.lng)) {
       setIsOutsidePalananState(true);
       setLocationError(
@@ -233,15 +241,9 @@ export default function Report() {
       return;
     }
 
-    // 3. Check if description is present
+    // 4. Check if description is present
     if (!description.trim()) {
       descriptionInputRef.current?.focus();
-      return;
-    }
-
-    // 4. Demo Mode Check (Only blocks the explicit Guest Demo account)
-    if (isDemo) {
-      setShowDemoModal(true);
       return;
     }
     
@@ -306,6 +308,42 @@ export default function Report() {
         </div>
         <p className={`text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Help fellow residents bypass and avoid unsafe locations.</p>
       </div>
+
+      {isDemo && (
+        <div className={`p-5 rounded-3xl border flex flex-col gap-3 transition-all ${
+          darkMode ? 'bg-amber-950/30 border-amber-800/40 text-amber-200' : 'bg-amber-50 border-amber-200 text-amber-900 shadow-sm'
+        }`}>
+          <div className="flex items-start gap-3">
+            <div className="p-2.5 rounded-2xl bg-amber-500/20 text-amber-600 shrink-0 mt-0.5">
+              <Lock className="w-5 h-5" />
+            </div>
+            <div className="space-y-1">
+              <div className="font-black text-sm">Demo Mode: Hazard Reporting is for Registered Residents Only</div>
+              <p className="text-xs leading-relaxed opacity-90 font-medium">
+                You are currently browsing in Guest / Demo Mode. To maintain data integrity and prevent false community alerts in Barangay Palanan, only registered residents with verified accounts are permitted to submit official hazard reports.
+              </p>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-amber-500/20">
+            <button
+              type="button"
+              onClick={() => navigate('/login')}
+              className="px-4 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs uppercase tracking-wider transition-all shadow-sm active:scale-95 cursor-pointer"
+            >
+              Sign In as Resident
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/register')}
+              className={`px-4 py-2.5 rounded-xl font-bold text-xs uppercase tracking-wider transition-all border active:scale-95 cursor-pointer ${
+                darkMode ? 'bg-slate-900 border-amber-700/60 text-amber-300 hover:bg-slate-800' : 'bg-white border-amber-300 text-amber-900 hover:bg-amber-50'
+              }`}
+            >
+              Register Account
+            </button>
+          </div>
+        </div>
+      )}
 
       <form onSubmit={handleSubmit} className="space-y-6">
         <div className="space-y-4">
@@ -555,6 +593,8 @@ export default function Report() {
           className={`w-full font-bold py-5 rounded-3xl shadow-xl active:scale-[0.98] transition-all flex items-center justify-center gap-2 cursor-pointer ${
             loading
               ? 'opacity-60 cursor-not-allowed bg-slate-700 text-white'
+              : isDemo
+              ? 'bg-amber-600 hover:bg-amber-700 text-white shadow-amber-300/40 dark:shadow-none'
               : isOutsidePalananState
               ? 'bg-red-600 hover:bg-red-700 text-white shadow-red-200 dark:shadow-none'
               : !location
@@ -570,6 +610,11 @@ export default function Report() {
             <>
               <Loader2 className="w-5 h-5 animate-spin" />
               <span>Submitting Report...</span>
+            </>
+          ) : isDemo ? (
+            <>
+              <Lock className="w-5 h-5 text-amber-200" />
+              <span>Reporting Disabled (Registered Residents Only)</span>
             </>
           ) : isOutsidePalananState ? (
             <>
@@ -602,28 +647,46 @@ export default function Report() {
             darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'
           }`}>
             <div className="w-14 h-14 mx-auto rounded-2xl bg-amber-500/15 border border-amber-500/30 flex items-center justify-center text-amber-500">
-              <ShieldAlert className="w-8 h-8" />
+              <Lock className="w-7 h-7" />
             </div>
 
             <div className="space-y-2">
               <h3 className="text-lg font-black text-amber-500">
-                Demo Mode: Reporting is disabled.
+                Registered Residents Only
               </h3>
               <p className={`text-xs leading-relaxed font-semibold ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>
-                Danger reports cannot be submitted during the demonstration to prevent false or test reports.
+                Hazard reporting is strictly reserved for verified Barangay Palanan residents to prevent inaccurate, test, or false danger zones on the community map.
               </p>
               <div className="text-[11px] font-bold text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-2.5 mt-2">
-                No report was submitted to Firebase.
+                You are currently in Demo Mode (Guest). Please sign in with your registered account to submit hazard reports.
               </div>
             </div>
 
-            <button
-              type="button"
-              onClick={() => setShowDemoModal(false)}
-              className="w-full py-3.5 px-4 rounded-2xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-bold text-xs uppercase tracking-wider transition-all shadow-md cursor-pointer"
-            >
-              Understood
-            </button>
+            <div className="space-y-2 pt-1">
+              <button
+                type="button"
+                onClick={() => navigate('/login')}
+                className="w-full py-3.5 px-4 rounded-2xl bg-blue-600 hover:bg-blue-700 active:scale-95 text-white font-bold text-xs uppercase tracking-wider transition-all shadow-md cursor-pointer"
+              >
+                Sign In with Registered Account
+              </button>
+              <button
+                type="button"
+                onClick={() => navigate('/register')}
+                className={`w-full py-3 px-4 rounded-2xl border font-bold text-xs uppercase tracking-wider transition-all active:scale-95 cursor-pointer ${
+                  darkMode ? 'bg-slate-800 border-slate-700 text-white hover:bg-slate-750' : 'bg-slate-100 border-slate-200 text-slate-800 hover:bg-slate-200'
+                }`}
+              >
+                Register as Resident
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowDemoModal(false)}
+                className="w-full py-2.5 px-4 text-slate-400 hover:text-slate-300 font-bold text-[11px] transition-colors cursor-pointer"
+              >
+                Continue in Demo Mode (View Only)
+              </button>
+            </div>
           </div>
         </div>
       )}

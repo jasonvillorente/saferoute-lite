@@ -15,8 +15,18 @@
  */
 
 export function isDemoMode(user?: any, profile?: any): boolean {
+  // If explicitly flagged in guest local storage, it is always Demo Mode
+  if (typeof window !== 'undefined') {
+    try {
+      if (localStorage.getItem('safe_route_guest')) {
+        return true;
+      }
+    } catch (e) {}
+  }
+
+  // If no user or profile is present, it is an unauthenticated/guest session
   if (!user && !profile) {
-    return false;
+    return true;
   }
 
   const uid = String(user?.uid || profile?.uid || '').trim().toLowerCase();
@@ -27,6 +37,7 @@ export function isDemoMode(user?: any, profile?: any): boolean {
   if (
     user?.isGuest === true ||
     profile?.isGuest === true ||
+    user?.isAnonymous === true ||
     uid === 'guest-palanan-user' ||
     uid === 'guest' ||
     uid === 'demo-user' ||
@@ -37,8 +48,12 @@ export function isDemoMode(user?: any, profile?: any): boolean {
     return true;
   }
 
-  // Any user with a registered account is NOT in Demo Mode
+  // Any verified user with a registered account is NOT in Demo Mode
   return false;
+}
+
+export function isRegisteredResident(user?: any, profile?: any): boolean {
+  return !isDemoMode(user, profile) && !!(user || profile);
 }
 
 // Deprecated global constant - defaults to false so registered accounts are never blocked globally

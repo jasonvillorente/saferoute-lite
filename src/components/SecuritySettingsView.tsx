@@ -39,7 +39,7 @@ interface SecuritySettingsViewProps {
 type SecurityTab = 'menu' | 'password' | 'privacy' | 'login_security' | 'delete_account';
 
 export default function SecuritySettingsView({ onBack }: SecuritySettingsViewProps) {
-  const { user, profile, isDemoMode: authIsDemoMode } = useAuth();
+  const { user, profile, isDemoMode: authIsDemoMode, signOut } = useAuth();
   const isDemo = authIsDemoMode ?? checkDemoMode(user, profile);
   const { darkMode } = useTheme();
 
@@ -323,10 +323,8 @@ export default function SecuritySettingsView({ onBack }: SecuritySettingsViewPro
       localStorage.removeItem('saferoute_sos_active');
 
       try {
-        await auth.signOut();
+        await signOut();
       } catch (e) {}
-
-      window.location.href = '/login';
     } catch (err: any) {
       showToast('Error deleting account: ' + (err.message || 'Please try again'), 'error');
       setDeleteLoading(false);

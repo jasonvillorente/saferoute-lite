@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { 
@@ -15,7 +16,8 @@ import {
   CheckCircle2, 
   Sparkles, 
   Smartphone,
-  ShieldCheck
+  ShieldCheck,
+  Loader2
 } from 'lucide-react';
 import { auth } from '../lib/firebase';
 import { cn } from '../lib/utils';
@@ -24,9 +26,11 @@ import SecuritySettingsView from '../components/SecuritySettingsView';
 type ProfileView = 'main' | 'security' | 'notifications' | 'general';
 
 export default function Profile() {
-  const { profile, user } = useAuth();
+  const { profile, user, signOut } = useAuth();
   const { darkMode, toggleDarkMode } = useTheme();
+  const navigate = useNavigate();
   const [currentView, setCurrentView] = useState<ProfileView>('main');
+  const [isSigningOut, setIsSigningOut] = useState(false);
   const [notificationState, setNotificationState] = useState({
     sosAlerts: true,
     hazardAlerts: true,
@@ -52,14 +56,17 @@ export default function Profile() {
   ];
 
   const handleSignOut = async () => {
-    localStorage.removeItem('safe_route_guest');
-    localStorage.removeItem('safe_route_registered_user');
+    if (isSigningOut) return;
+    setIsSigningOut(true);
     try {
-      await auth.signOut();
+      await signOut();
+      navigate('/login', { replace: true });
     } catch (e) {
       console.warn('Sign out error:', e);
+      navigate('/login', { replace: true });
+    } finally {
+      setIsSigningOut(false);
     }
-    window.location.href = '/login';
   };
 
   const handleClearCache = () => {
@@ -321,15 +328,25 @@ export default function Profile() {
 
           <button
             onClick={handleSignOut}
+            disabled={isSigningOut}
             className={cn(
-              "w-full border-2 font-bold py-4 rounded-2xl flex items-center justify-center gap-2 transition-all duration-300",
+              "w-full border-2 font-bold py-4 rounded-2xl flex items-center justify-center gap-2 transition-all duration-300 cursor-pointer active:scale-98 disabled:opacity-50 disabled:cursor-not-allowed",
               darkMode 
                 ? "bg-slate-900 border-red-950/40 text-red-400 hover:bg-red-950/20" 
                 : "bg-white border-red-50 text-red-600 hover:bg-red-50"
             )}
           >
-            <LogOut className="w-5 h-5" />
-            Sign Out
+            {isSigningOut ? (
+              <>
+                <Loader2 className="w-5 h-5 animate-spin text-red-500" />
+                <span>Signing Out...</span>
+              </>
+            ) : (
+              <>
+                <LogOut className="w-5 h-5" />
+                <span>Sign Out</span>
+              </>
+            )}
           </button>
 
           <div className="text-center pt-2">

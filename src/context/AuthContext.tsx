@@ -88,6 +88,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Always subscribe to Firebase Auth state
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
+      // Check if user explicitly signed out recently
+      const justSignedOut = typeof window !== 'undefined' && sessionStorage.getItem('saferoute_just_signed_out') === '1';
+      if (justSignedOut) {
+        setUser(null);
+        setProfile(null);
+        setLoading(false);
+        return;
+      }
+
+      // If user is currently in explicit guest/demo mode, preserve guest session and do not override
+      const isGuestModeActive = typeof window !== 'undefined' && localStorage.getItem('safe_route_guest') !== null;
+      if (isGuestModeActive) {
+        if (firebaseUser) {
+          try {
+            await auth.signOut();
+          } catch (e) {}
+        }
+        loadLocalFallbackSession();
+        setLoading(false);
+        return;
+      }
+
       if (firebaseUser) {
         // Authenticated with real Firebase Account -> Clear any guest markers!
         localStorage.removeItem('safe_route_guest');
@@ -186,9 +208,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const loginAsGuest = () => {
+  const loginAsGuest = async () => {
     // Clear any registered user markers
     localStorage.removeItem('safe_route_registered_user');
+
+    try {
+      await auth.signOut();
+    } catch (e) {}
 
     const guestSession = {
       user: {
@@ -214,16 +240,35 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const signOut = async () => {
+    try {
+      if (typeof window !== 'undefined') {
+        sessionStorage.setItem('saferoute_just_signed_out', '1');
+      }
+    } catch (e) {}
+
+    // Clear all persisted sessions
     localStorage.removeItem('safe_route_guest');
     localStorage.removeItem('safe_route_registered_user');
+    localStorage.removeItem('saferoute_sos_active');
+    
+    // Clear in-memory React state immediately
     setUser(null);
     setProfile(null);
+
     try {
-      await auth.signOut();
+      await Promise.race([
+        auth.signOut(),
+        new Promise((resolve) => setTimeout(resolve, 1500))
+      ]);
     } catch (e) {
-      console.warn('Sign out error:', e);
+      console.warn('Sign out warning:', e);
+    } finally {
+      setTimeout(() => {
+        try {
+          sessionStorage.removeItem('saferoute_just_signed_out');
+        } catch (e) {}
+      }, 3000);
     }
-    window.location.href = '/login';
   };
 
   return (
