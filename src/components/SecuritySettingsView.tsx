@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { 
   Shield, 
+  ShieldCheck,
   KeyRound, 
   Lock, 
   Eye, 
@@ -782,6 +783,18 @@ export default function SecuritySettingsView({ onBack }: SecuritySettingsViewPro
               >
                 <div className="w-5.5 h-5.5 rounded-full bg-white shadow-md" />
               </button>
+            </div>
+
+            {/* On-Device Location Privacy Notice */}
+            <div className={cn(
+              "p-4 rounded-2xl border flex items-start gap-3 shadow-xs",
+              darkMode ? "bg-blue-950/30 border-blue-900/50 text-blue-200" : "bg-blue-50/80 border-blue-200/80 text-blue-900"
+            )}>
+              <ShieldCheck className="w-5 h-5 text-blue-600 dark:text-blue-400 shrink-0 mt-0.5" />
+              <div className="text-left text-xs leading-relaxed">
+                <span className="font-bold block mb-0.5">On-Device Location Privacy</span>
+                Your location is used only on your device to show your position and warn you near caution areas.
+              </div>
             </div>
           </div>
 

@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Shield, MapPin, AlertTriangle, CheckCircle2, Phone, Moon, Sun, History, ShieldAlert } from 'lucide-react';
+import { Shield, MapPin, AlertTriangle, CheckCircle2, Phone, Moon, Sun, History, ShieldAlert, Clock } from 'lucide-react';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { collection, query, onSnapshot } from 'firebase/firestore';
@@ -8,45 +8,13 @@ import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { DangerZone, safeGetCoords, isZoneResolved } from '../types';
 import { isDemoMode as checkDemoMode } from '../config/demo';
 import { motion } from 'motion/react';
-
-// Helper to robustly resolve danger zone risk level from various fields set by the Admin Portal or app
-function resolveRiskLevel(zone: any): 'low' | 'moderate' | 'high' | 'critical' {
-  if (!zone) return 'moderate';
-
-  // Check all potential database property keys that the Admin Portal might write
-  const rawValue = zone.riskLevel || zone.risk_level || zone.risk || zone.dangerLevel || zone.danger_level || zone.severity || zone.level || zone.category;
-  
-  if (rawValue !== undefined && rawValue !== null) {
-    const str = String(rawValue).trim().toLowerCase();
-    
-    // Low risk aliases
-    if (str === 'low' || str === 'safe' || str === '1' || str === 'green') {
-      return 'low';
-    }
-    // Moderate risk aliases
-    if (str === 'moderate' || str === 'medium' || str === 'yellow' || str === '2' || str === 'warning') {
-      return 'moderate';
-    }
-    // High risk aliases
-    if (str === 'high' || str === 'orange' || str === '3') {
-      return 'high';
-    }
-    // Critical risk aliases
-    if (str === 'critical' || str === 'danger' || str === 'red' || str === 'extreme' || str === '4') {
-      return 'critical';
-    }
-  }
-
-  // Fallback to calculation based on radius if no field is present
-  const r = Number(zone.radius);
-  if (!isNaN(r)) {
-    if (r <= 60) return 'low';
-    if (r <= 120) return 'moderate';
-    if (r <= 170) return 'high';
-  }
-  
-  return 'critical';
-}
+import { ZONE_LABEL, ZONE_LABEL_PLURAL } from '../constants/labels';
+import { isInsidePalanan } from '../lib/palananBounds';
+import { 
+  normalizeDangerZone, 
+  isZoneActiveNow, 
+  calculateHomeSafetyScore 
+} from '../utils/zoneUtils';
 
 export default function Home() {
   const { profile, user, isDemoMode: authIsDemoMode } = useAuth();
@@ -55,6 +23,15 @@ export default function Home() {
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [routeHistory, setRouteHistory] = useState<{ start: string; end: string; safety: string; time: string }[]>([]);
   const [permissionError, setPermissionError] = useState(false);
+  const [, setTick] = useState(0);
+
+  // 1-minute clock tick to re-evaluate active time windows in real time
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setTick(prev => prev + 1);
+    }, 60000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Emergency Hotlines list (Ahon Palanan Mobile Contacts)
   const hotlines = [
@@ -73,32 +50,24 @@ export default function Home() {
       const mergedMap = new Map<string, DangerZone>();
       rawZones1.forEach(z => mergedMap.set(z.id, z));
       rawZones2.forEach(z => mergedMap.set(z.id, z));
-      // Only keep active, non-resolved danger zones with valid coordinates
-      const activeUnresolved = Array.from(mergedMap.values()).filter(
-        z => z && z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number' && !isZoneResolved(z) && z.active !== false
+      // Keep valid non-resolved danger zones strictly inside bounds and not needing location
+      const unresolved = Array.from(mergedMap.values()).filter(
+        z => z && z.active !== false && !isZoneResolved(z) && !z.needsLocation &&
+             z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number' &&
+             !(z.location.lat === 0 && z.location.lng === 0) &&
+             isInsidePalanan(z.location.lat, z.location.lng)
       );
-      setZones(activeUnresolved);
+      setZones(unresolved);
     };
 
     const unsubZones1 = onSnapshot(collection(db, 'danger_zones'), (snapshot) => {
       rawZones1 = snapshot.docs.map(docSnap => {
         const data = docSnap.data();
-        const loc = safeGetCoords(data) || { lat: 14.56038, lng: 120.99800 };
-        const isResolved = isZoneResolved(data);
-        const active = !isResolved && (
-          data.active !== undefined 
-            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-            : (data.status === 'active' || data.status === 'approved' || !data.status)
-        );
-        const radius = Number(data.radius) || 100;
-        return {
-          id: docSnap.id,
-          ...data,
-          location: loc,
-          radius,
-          active,
-          resolved: isResolved
-        } as DangerZone;
+        const loc = safeGetCoords(data);
+        if (!loc) {
+          return normalizeDangerZone({ ...data, id: docSnap.id, needsLocation: true, active: false, isResolved: true });
+        }
+        return normalizeDangerZone({ ...data, id: docSnap.id, location: loc, latitude: loc.lat, longitude: loc.lng });
       });
       updateMergedZones();
     }, (error) => {
@@ -111,22 +80,11 @@ export default function Home() {
     const unsubZones2 = onSnapshot(collection(db, 'danger__zones'), (snapshot) => {
       rawZones2 = snapshot.docs.map(docSnap => {
         const data = docSnap.data();
-        const loc = safeGetCoords(data) || { lat: 14.56038, lng: 120.99800 };
-        const isResolved = isZoneResolved(data);
-        const active = !isResolved && (
-          data.active !== undefined 
-            ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-            : (data.status === 'active' || data.status === 'approved' || !data.status)
-        );
-        const radius = Number(data.radius) || 100;
-        return {
-          id: docSnap.id,
-          ...data,
-          location: loc,
-          radius,
-          active,
-          resolved: isResolved
-        } as DangerZone;
+        const loc = safeGetCoords(data);
+        if (!loc) {
+          return normalizeDangerZone({ ...data, id: docSnap.id, needsLocation: true, active: false, isResolved: true });
+        }
+        return normalizeDangerZone({ ...data, id: docSnap.id, location: loc, latitude: loc.lat, longitude: loc.lng });
       });
       updateMergedZones();
     }, (error) => {
@@ -148,21 +106,13 @@ export default function Home() {
     };
   }, []);
 
+  // Filter currently active zones based on time window
+  const activeNowZones = zones.filter(z => isZoneActiveNow(z));
+  const totalZonesCount = zones.length;
+  const activeNowCount = activeNowZones.length;
 
-  // Dynamic route risk score metrics strictly from Danger Zones
-  const activeZones = zones.filter(z => z.active);
-  const verifiedDangerZonesCount = activeZones.length;
-  
-  const highRiskZonesCount = activeZones.filter(z => {
-    const risk = resolveRiskLevel(z);
-    return risk === 'high' || risk === 'critical';
-  }).length;
-
-  const moderateZonesCount = activeZones.filter(z => resolveRiskLevel(z) === 'moderate').length;
-  const lowZonesCount = activeZones.filter(z => resolveRiskLevel(z) === 'low').length;
-
-  // Deduction logic: 15% for High/Critical risk, 10% for Moderate risk, 5% for Low risk
-  const globalSafetyScore = Math.max(0, 100 - (lowZonesCount * 5) - (moderateZonesCount * 10) - (highRiskZonesCount * 15));
+  // Count-based formula with crime contribution capped at 30 points
+  const globalSafetyScore = calculateHomeSafetyScore(activeNowZones);
 
   return (
     <div className="space-y-6 pb-20">
@@ -234,19 +184,19 @@ export default function Home() {
       {/* Safety Statistics Grid */}
       <div className="grid grid-cols-2 gap-4">
         <div className={`p-5 rounded-3xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100 shadow-sm'}`}>
-          <div className="bg-orange-500/10 w-10 h-10 rounded-2xl flex items-center justify-center mb-3">
-            <AlertTriangle className="w-5 h-5 text-orange-500" />
+          <div className={`w-10 h-10 rounded-2xl flex items-center justify-center mb-3 ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-700'}`}>
+            <Clock className="w-5 h-5" />
           </div>
-          <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{highRiskZonesCount}</div>
-          <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">High-Risk Zones</div>
+          <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{activeNowCount}</div>
+          <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">Active Now ({ZONE_LABEL_PLURAL})</div>
         </div>
         
         <div className={`p-5 rounded-3xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100 shadow-sm'}`}>
-          <div className="bg-red-500/10 w-10 h-10 rounded-2xl flex items-center justify-center mb-3">
-            <ShieldAlert className="w-5 h-5 text-red-500" />
+          <div className={`w-10 h-10 rounded-2xl flex items-center justify-center mb-3 ${darkMode ? 'bg-slate-800 text-slate-300' : 'bg-slate-100 text-slate-700'}`}>
+            <ShieldAlert className="w-5 h-5" />
           </div>
-          <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{verifiedDangerZonesCount}</div>
-          <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">Total Danger Zones</div>
+          <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{totalZonesCount}</div>
+          <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">Total {ZONE_LABEL_PLURAL}</div>
         </div>
       </div>
 

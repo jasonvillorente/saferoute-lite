@@ -53,6 +53,9 @@ export interface Report {
   updatedAt: Timestamp;
 }
 
+export type ZoneSource = 'barangay_data' | 'resident_report' | 'both';
+export type ZoneActiveTime = 'night_only' | 'day_only' | 'all_day';
+
 export interface DangerZone {
   id: string;
   location: {
@@ -61,32 +64,89 @@ export interface DangerZone {
   };
   radius: number;
   description: string;
-  addedBy: string;
-  createdAt: Timestamp;
+  addedBy?: string;
+  createdAt?: Timestamp | any;
   active: boolean;
   name?: string;
-  riskLevel?: 'low' | 'moderate' | 'high' | 'critical';
+  locationName?: string;
+  latitude?: number;
+  longitude?: number;
+  category?: string;
+  riskLevel?: 'low' | 'moderate' | 'high' | 'critical' | string;
   type?: 'marker' | 'circle' | 'polygon';
   polygonPoints?: [number, number][];
   status?: string;
+  needsLocation?: boolean;
   resolved?: boolean;
   isResolved?: boolean;
   resolutionStatus?: string;
+
+  // New Data Contract fields
+  source?: ZoneSource | string;
+  activeTime?: ZoneActiveTime | string;
+  startHour?: number;
+  endHour?: number;
+  nightCrimeCount?: number;
+  dayCrimeCount?: number;
+  crimeCount?: number;
+  crimeTypes?: Record<string, number>;
+  dataPeriod?: string;
+  lastIncidentDate?: string | Timestamp | any;
+  updatedAt?: Timestamp | any;
 }
 
 /**
- * Checks if a danger zone or incident report is marked as resolved / closed / inactive.
+ * Checks if a danger zone or incident report is marked as resolved / closed / inactive / needsLocation.
  * When marked as resolved, it is excluded from safety route risk penalties and hazard circles.
  */
 export function isZoneResolved(zone: any): boolean {
   if (!zone) return false;
   if (zone.resolved === true || zone.resolved === 'true') return true;
   if (zone.isResolved === true || zone.isResolved === 'true') return true;
+  if (zone.needsLocation === true || zone.needsLocation === 'true') return true;
   if (zone.resolutionStatus === 'resolved' || zone.resolutionStatus === 'closed') return true;
   const status = String(zone.status || '').trim().toLowerCase();
   if (status === 'resolved' || status === 'closed' || status === 'archived' || status === 'inactive') return true;
   if (zone.active === false || zone.active === 'false') return true;
   return false;
+}
+
+export type SafetyLevel = 'safe' | 'moderate' | 'danger';
+
+export interface RouteSegment {
+  coordinates: [number, number][];
+  color: string;
+  weight?: number;
+  opacity?: number;
+  inZone?: boolean;
+  crimeCount?: number;
+}
+
+export interface CalculatedRoute {
+  id?: string;
+  coordinates: [number, number][];
+  distance: number; // meters
+  duration: number; // seconds
+  steps: {
+    instruction: string;
+    distance: number;
+    name: string;
+  }[];
+  safety: SafetyLevel;
+  safetyScore: number;
+  name: string;
+  totalCost: number;
+  segments: RouteSegment[];
+  metersInside?: number;
+  metersBuffer?: number;
+  crimeWeightedExposure?: number;
+  passedZonesCount?: number;
+  summaryText?: string;
+  isAvoidanceRoute?: boolean;
+  isOverCap?: boolean;
+  extraDistance?: number;
+  extraDuration?: number;
+  minClearance?: number;
 }
 
 export interface Notification {

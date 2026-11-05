@@ -52,9 +52,8 @@ export function isDemoMode(user?: any, profile?: any): boolean {
   return false;
 }
 
+
 export function isRegisteredResident(user?: any, profile?: any): boolean {
   return !isDemoMode(user, profile) && !!(user || profile);
 }
 
-// Deprecated global constant - defaults to false so registered accounts are never blocked globally
-export const DEMO_MODE = false;

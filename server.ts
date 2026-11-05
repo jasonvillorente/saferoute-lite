@@ -22,6 +22,32 @@ import {
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+const ipRateLimitMap = new Map<string, { count: number; resetTime: number }>();
+
+function checkIpRateLimit(ip: string, maxRequests = 20, windowMs = 60000): boolean {
+  const now = Date.now();
+  const entry = ipRateLimitMap.get(ip);
+  if (!entry || now > entry.resetTime) {
+    ipRateLimitMap.set(ip, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (entry.count >= maxRequests) {
+    return false;
+  }
+  entry.count++;
+  return true;
+}
+
+function haversineDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
+  const R = 6371000;
+  const dLat = ((lat2 - lat1) * Math.PI) / 180;
+  const dLng = ((lng2 - lng1) * Math.PI) / 180;
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos((lat1 * Math.PI) / 180) * Math.cos((lat2 * Math.PI) / 180) * Math.sin(dLng / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
 async function startServer() {
   const app = express();
   const PORT = 3000;
@@ -29,6 +55,46 @@ async function startServer() {
   // Middleware - Support larger payloads for hazard photo attachments & batch syncs
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
+
+  // CORS configuration for web browsers and packaged Capacitor mobile applications (Android/iOS)
+  app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    const allowedOrigins = [
+      'https://localhost',
+      'http://localhost',
+      'capacitor://localhost',
+      'ionic://localhost'
+    ];
+
+    if (process.env.APP_URL) {
+      try {
+        const appUrlOrigin = new URL(process.env.APP_URL).origin;
+        if (!allowedOrigins.includes(appUrlOrigin)) allowedOrigins.push(appUrlOrigin);
+      } catch {}
+    }
+
+    if (origin) {
+      if (
+        allowedOrigins.includes(origin) ||
+        origin.endsWith('.run.app') ||
+        origin.includes('localhost') ||
+        origin.includes('127.0.0.1')
+      ) {
+        res.setHeader('Access-Control-Allow-Origin', origin);
+      }
+    } else {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    }
+
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204);
+    }
+    next();
+  });
 
   // Load Firebase Application credentials from firebase-applet-config.json
   const configPath = path.join(process.cwd(), 'firebase-applet-config.json');
@@ -57,6 +123,153 @@ async function startServer() {
   // Health check
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', firebaseConnected: !!db });
+  });
+
+  // OpenRouteService Proxy API: Avoid-polygons routing with server-side API key
+  // Hardened with IP rate limiting, study-area bounds checks, polygon caps, and 3 km max distance.
+  app.post('/api/directions/ors', async (req, res) => {
+    const apiKey = process.env.OPENROUTESERVICE_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'OPENROUTESERVICE_KEY not configured', disabled: true });
+    }
+
+    // 1. Rate limiting per IP: maximum 20 requests per minute
+    const clientIp = (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() || req.socket.remoteAddress || '127.0.0.1';
+    if (!checkIpRateLimit(clientIp, 20, 60000)) {
+      console.warn(`[ORS Proxy] Rate limit exceeded for IP: ${clientIp}`);
+      return res.status(429).json({ error: 'Rate limit exceeded: maximum 20 requests per minute.' });
+    }
+
+    const { coordinates, avoidPolygons } = req.body;
+
+    // 2. Coordinates validation: exactly 2 points [start, end]
+    if (!coordinates || !Array.isArray(coordinates) || coordinates.length !== 2) {
+      return res.status(400).json({ error: 'Invalid coordinates: array of exactly 2 points [origin, destination] required.' });
+    }
+
+    for (const pt of coordinates) {
+      if (!Array.isArray(pt) || pt.length !== 2 || typeof pt[0] !== 'number' || typeof pt[1] !== 'number' || isNaN(pt[0]) || isNaN(pt[1])) {
+        return res.status(400).json({ error: 'Invalid coordinate values: each point must contain [longitude, latitude].' });
+      }
+    }
+
+    // Coordinates in GeoJSON are [longitude, latitude]
+    const startLng = coordinates[0][0];
+    const startLat = coordinates[0][1];
+    const endLng = coordinates[1][0];
+    const endLat = coordinates[1][1];
+
+    // 3. Study-area bounds validation: coordinates must reside within Barangay Palanan (with margin for road snapping)
+    // Palanan bounds: lat 14.5510 - 14.5680, lng 120.9900 - 121.0080
+    const MIN_LAT = 14.5490;
+    const MAX_LAT = 14.5700;
+    const MIN_LNG = 120.9880;
+    const MAX_LNG = 121.0100;
+
+    if (
+      startLat < MIN_LAT || startLat > MAX_LAT || startLng < MIN_LNG || startLng > MAX_LNG ||
+      endLat < MIN_LAT || endLat > MAX_LAT || endLng < MIN_LNG || endLng > MAX_LNG
+    ) {
+      return res.status(400).json({ error: 'Coordinates must be located within the Barangay Palanan study-area bounds.' });
+    }
+
+    // 4. Maximum route distance validation: maximum 3 km
+    const directDistanceMeters = haversineDistanceMeters(startLat, startLng, endLat, endLng);
+    if (directDistanceMeters > 3000) {
+      return res.status(400).json({ error: 'Route distance exceeds maximum limit of 3 km.' });
+    }
+
+    // 5. Avoid polygons validation: at most 1 polygon set, maximum 10 polygons, each maximum 64 vertices
+    if (avoidPolygons !== undefined && avoidPolygons !== null) {
+      if (!Array.isArray(avoidPolygons)) {
+        return res.status(400).json({ error: 'avoidPolygons must be an array.' });
+      }
+      if (avoidPolygons.length > 10) {
+        return res.status(400).json({ error: 'Maximum of 10 avoid polygons permitted.' });
+      }
+
+      for (let pIdx = 0; pIdx < avoidPolygons.length; pIdx++) {
+        const poly = avoidPolygons[pIdx];
+        if (!Array.isArray(poly) || poly.length === 0) {
+          return res.status(400).json({ error: `Polygon at index ${pIdx} is invalid.` });
+        }
+        const exteriorRing = poly[0];
+        if (!Array.isArray(exteriorRing) || exteriorRing.length === 0) {
+          return res.status(400).json({ error: `Polygon ring at index ${pIdx} is empty.` });
+        }
+        if (exteriorRing.length > 64) {
+          return res.status(400).json({ error: `Polygon at index ${pIdx} exceeds 64 vertices limit (${exteriorRing.length} vertices).` });
+        }
+        for (const vertex of exteriorRing) {
+          if (!Array.isArray(vertex) || vertex.length !== 2 || typeof vertex[0] !== 'number' || typeof vertex[1] !== 'number') {
+            return res.status(400).json({ error: `Invalid vertex coordinate in polygon at index ${pIdx}.` });
+          }
+        }
+      }
+    }
+
+    const body: any = {
+      coordinates
+    };
+
+    if (avoidPolygons && Array.isArray(avoidPolygons) && avoidPolygons.length > 0) {
+      body.options = {
+        avoid_polygons: {
+          type: 'MultiPolygon',
+          coordinates: avoidPolygons
+        }
+      };
+    }
+
+    const startTime = Date.now();
+    console.log(`[ORS Proxy] Live call initiating for IP ${clientIp} (coords: [${startLat.toFixed(5)}, ${startLng.toFixed(5)}] -> [${endLat.toFixed(5)}, ${endLng.toFixed(5)}], avoidPolygons: ${avoidPolygons?.length || 0})`);
+
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const orsResponse = await fetch('https://api.openrouteservice.org/v2/directions/foot-walking/geojson', {
+        method: 'POST',
+        headers: {
+          'Authorization': apiKey,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(body),
+        signal: controller.signal
+      });
+      clearTimeout(timeout);
+
+      const elapsed = Date.now() - startTime;
+      const polygonSummary = avoidPolygons && Array.isArray(avoidPolygons)
+        ? `${avoidPolygons.length} polygons (${avoidPolygons.map((p: any) => p[0]?.length || 0).join(', ')} vertices)`
+        : '0 polygons';
+
+      if (!orsResponse.ok) {
+        const errText = await orsResponse.text();
+        let parsedError: any = null;
+        try {
+          parsedError = JSON.parse(errText);
+        } catch {}
+
+        // Never log or return the API key
+        console.warn(`[ORS Proxy] LIVE OpenRouteService error status ${orsResponse.status} in ${elapsed}ms. Error body: ${errText.substring(0, 300)}. Sent request: coords=${JSON.stringify(coordinates)}, polygons=${polygonSummary}`);
+
+        return res.status(orsResponse.status).json({
+          error: parsedError?.error?.message || `OpenRouteService request failed with status ${orsResponse.status}`,
+          code: parsedError?.error?.code || null,
+          orsError: parsedError?.error || null,
+          status: orsResponse.status
+        });
+      }
+
+      console.log(`[ORS Proxy] LIVE OpenRouteService status 200 in ${elapsed}ms. Sent request: coords=${JSON.stringify(coordinates)}, polygons=${polygonSummary}`);
+      const data = await orsResponse.json();
+      return res.json(data);
+    } catch (err: any) {
+      const elapsed = Date.now() - startTime;
+      console.warn(`[ORS Proxy] Request failed in ${elapsed}ms:`, err.message || 'Unknown network error');
+      return res.status(500).json({ error: err.message || 'ORS request failed' });
+    }
   });
 
   // SERVER-SIDE SYNC API: Resident Synchronization across all central collections

@@ -1,6 +1,7 @@
 import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { MapPin, Target, ShieldCheck, Lock } from 'lucide-react';
+import { ZONE_LABEL_PLURAL } from '../constants/labels';
 
 interface LocationAccuracyModalProps {
   isOpen: boolean;
@@ -118,7 +119,7 @@ export const LocationAccuracyModal: React.FC<LocationAccuracyModalProps> = ({
                       Location Accuracy (Recommended)
                     </h4>
                     <p className="text-[11px] sm:text-[11.5px] text-slate-600 leading-relaxed mt-0.5">
-                      Provides accurate location to show safe routes, danger zones, and community alerts in real time using device sensors.
+                      Provides accurate location to show safe routes, {ZONE_LABEL_PLURAL.toLowerCase()}, and community alerts in real time using device sensors.
                     </p>
                   </div>
                 </div>

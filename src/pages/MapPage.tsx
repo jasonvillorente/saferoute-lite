@@ -5,38 +5,51 @@ import L from 'leaflet';
 import { db } from '../lib/firebase';
 import { handleFirestoreError, OperationType } from '../lib/error-handler';
 import { useAuth } from '../context/AuthContext';
-import { Report, DangerZone, SavedPlace, PlaceCategory, safeGetCoords, CommunitySpot, CommunitySpotCategory, isZoneResolved } from '../types';
-import { isDemoMode as checkDemoMode } from '../config/demo';
-import { isInsidePalanan } from '../lib/palananBounds';
 import { 
-  checkLocationPermission, 
-  requestLocationPermission, 
-  getCurrentGpsPosition, 
-  watchGpsPosition, 
-  GpsLocationResult 
-} from '../lib/nativeLocation';
-
-// In-memory route caching to eliminate public OSRM rate limiting & APK WebView network delays
-const globalRouteCache = new Map<string, any>();
-
-function getRouteCacheKey(start: [number, number], waypoints: [number, number][], end: [number, number]): string {
-  const points = [start, ...waypoints, end];
-  return points.map(p => `${p[0].toFixed(5)},${p[1].toFixed(5)}`).join(';');
-}
-
-async function fetchRouteJsonWithTimeout(url: string, timeoutMs = 4000): Promise<any | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(timer);
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    clearTimeout(timer);
-    return null;
-  }
-}
+  Report, 
+  DangerZone, 
+  SavedPlace, 
+  PlaceCategory, 
+  safeGetCoords, 
+  CommunitySpot, 
+  CommunitySpotCategory, 
+  isZoneResolved,
+  CalculatedRoute,
+  SafetyLevel,
+  RouteSegment
+} from '../types';
+import { isDemoMode as checkDemoMode } from '../config/demo';
+import { isInsidePalanan, PALANAN_BOUNDS, PALANAN_CENTER } from '../lib/palananBounds';
+import { useLocationTracker } from '../hooks/useLocationTracker';
+import { UserLocationMarker } from '../components/UserLocationMarker';
+import { GpsStatusChip } from '../components/GpsStatusChip';
+import { getDistanceToRouteMeters } from '../utils/offRouteDetector';
+import { getRouteStartFromGps, GpsStartResult } from '../utils/gpsRouting';
+import { ZONE_LABEL, ZONE_LABEL_PLURAL, CAUTION_AREA_LABEL } from '../constants/labels';
+import { 
+  normalizeDangerZone, 
+  isZoneActiveNow, 
+  isZoneCurrentlyActive,
+  getSourceLabel, 
+  formatActiveTimeWindow, 
+  formatIncidentCountText, 
+  getZoneMapStyles, 
+  escapeHtml,
+  ZONE_COLOR
+} from '../utils/zoneUtils';
+import {
+  generateSuggestedRoutes,
+  processRoutePipeline,
+  computeRouteZoneMetrics,
+  computeInZonePolylinesAtRenderTime,
+  InZonePolylineSegment,
+  areRoutesNearDuplicates,
+  getDistanceMeters,
+  getMinDistanceToSegmentMeters,
+  getDemoTripSavedRoutes,
+  RawRouteCandidate
+} from '../utils/routeUtils';
+import { isSpotVisibleOnMap, isSpotAuthorPending } from '../utils/communitySpotUtils';
 import { 
   AlertCircle, 
   ShieldAlert,
@@ -48,6 +61,7 @@ import {
   Play,
   Square,
   Compass,
+  Clock,
   Timer,
   ChevronRight,
   RotateCcw,
@@ -80,7 +94,7 @@ import { motion, AnimatePresence } from 'motion/react';
 // Leaflet markers shadow url
 const markerShadow = 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png';
 
-const createCommunitySpotIcon = (category: CommunitySpotCategory, isSelected: boolean = false) => {
+const createCommunitySpotIcon = (category: CommunitySpotCategory, isSelected: boolean = false, isPending: boolean = false) => {
   let badgeColor = '#10b981'; // emerald for safe_haven
   let badgeBorder = '#047857';
   let emoji = '🛡️';
@@ -103,18 +117,25 @@ const createCommunitySpotIcon = (category: CommunitySpotCategory, isSelected: bo
     emoji = '🌟';
   }
 
+  if (isPending) {
+    badgeColor = '#d97706'; // amber-600
+    badgeBorder = '#b45309'; // amber-700
+  }
+
   const pulseClass = isSelected ? 'scale-125 z-50 ring-4 ring-emerald-400 rounded-full' : '';
+  const dashedClass = isPending ? 'border-2 border-dashed border-amber-300 ring-2 ring-amber-400/50' : 'border-2';
 
   return L.divIcon({
     html: `
       <div class="relative flex flex-col items-center group cursor-pointer ${pulseClass}">
-        <div class="w-9 h-9 rounded-full flex items-center justify-center text-base shadow-xl border-2 transition-transform duration-200 group-hover:scale-110"
+        <div class="w-9 h-9 rounded-full flex items-center justify-center text-base shadow-xl ${dashedClass} transition-transform duration-200 group-hover:scale-110"
              style="background-color: ${badgeColor}; border-color: ${badgeBorder}; color: white;">
           ${emoji}
         </div>
         <div class="w-0 h-0 border-l-[5px] border-l-transparent border-r-[5px] border-r-transparent border-t-[7px]"
              style="border-t-color: ${badgeColor}; margin-top: -1px;">
         </div>
+        ${isPending ? `<div class="absolute -top-1.5 -right-1.5 bg-amber-500 text-[9px] font-black text-white px-1 py-0.2 rounded-full border border-white shadow-xs leading-none">⏳</div>` : ''}
         <div class="w-2.5 h-1 bg-black/30 rounded-full blur-[1px] mt-0.5"></div>
       </div>
     `,
@@ -231,13 +252,7 @@ const createSavedPlaceIcon = (emoji: string) => {
   });
 };
 
-const PALANAN_CENTER: [number, number] = [14.56038, 120.99800];
-
-// Enforce strict bounds around Barangay Palanan to prevent panning outside
-const PALANAN_BOUNDS: [[number, number], [number, number]] = [
-  [14.5510, 120.9900], // Southwest bound (Buendia LRT / Taft corridor)
-  [14.5680, 121.0080]  // Northeast bound (Zobel Roxas / Pres. Osmeña Hwy)
-];
+// Shared bounds and center imported from ../lib/palananBounds
 
 const PALANAN_PLACES = [
   { name: 'Palanan Barangay Hall', latLng: [14.55986, 120.99925] as [number, number], address: 'Dian Street, Palanan, Makati' },
@@ -257,67 +272,7 @@ const PALANAN_SAFE_ZONES = [
   { latLng: [14.56200, 120.99845] as [number, number], radius: 85, name: "Faraday Safe Corridor", desc: "Bright nighttime lighting & neighborhood watch" }
 ];
 
-type SafetyLevel = 'safe' | 'moderate' | 'danger';
-
-interface CalculatedRoute {
-  coordinates: [number, number][];
-  distance: number; // meters
-  duration: number; // seconds
-  steps: {
-    instruction: string;
-    distance: number;
-    name: string;
-  }[];
-  safety: SafetyLevel;
-  safetyScore: number;
-  name: string;
-  totalCost: number;
-  segments: {
-    coordinates: [number, number][];
-    color: string;
-  }[];
-}
-
-// Haversine exact distance formula
-function getDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
-  const R = 6371000;
-  const dLat = (lat2 - lat1) * Math.PI / 180;
-  const dLng = (lng2 - lng1) * Math.PI / 180;
-  const a = 
-    Math.sin(dLat/2) * Math.sin(dLat/2) +
-    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) * 
-    Math.sin(dLng/2) * Math.sin(dLng/2);
-  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-  return R * c;
-}
-
-// Calculate exact shortest distance in meters from a point (pLat, pLng) to a line segment (lat1,lng1 -> lat2,lng2)
-function getMinDistanceToSegmentMeters(
-  lat1: number, lng1: number,
-  lat2: number, lng2: number,
-  pLat: number, pLng: number
-): number {
-  const cosLat = Math.cos(lat1 * Math.PI / 180);
-  const bx = (lng2 - lng1) * 111000 * cosLat;
-  const by = (lat2 - lat1) * 111000;
-  const px = (pLng - lng1) * 111000 * cosLat;
-  const py = (pLat - lat1) * 111000;
-
-  const ab2 = bx * bx + by * by;
-  if (ab2 === 0) {
-    return getDistanceMeters(lat1, lng1, pLat, pLng);
-  }
-
-  let t = (px * bx + py * by) / ab2;
-  t = Math.max(0, Math.min(1, t));
-
-  const cx = t * bx;
-  const cy = t * by;
-
-  const dx = px - cx;
-  const dy = py - cy;
-  return Math.sqrt(dx * dx + dy * dy);
-}
+// Types and distance utilities imported from ../types and ../utils/routeUtils
 
 // Custom map events delegate
 interface MapEventsProps {
@@ -356,6 +311,28 @@ function EnforceBoundsAndSettings() {
     return () => {
       map.off('drag', handleDrag);
     };
+  }, [map]);
+  return null;
+}
+
+// Dedicated Leaflet Panes initializer: guarantees panes exist immediately with proper zIndex and pointer-events
+function MapPanesSetup() {
+  const map = useMap();
+  useEffect(() => {
+    if (!map) return;
+    if (!map.getPane('dangerZonesPane')) {
+      const p = map.createPane('dangerZonesPane');
+      p.style.zIndex = '350';
+    }
+    if (!map.getPane('routeUnderlayPane')) {
+      const p = map.createPane('routeUnderlayPane');
+      p.style.zIndex = '450';
+    }
+    if (!map.getPane('inZoneHeatmapPane')) {
+      const p = map.createPane('inZoneHeatmapPane');
+      p.style.zIndex = '620';
+      p.style.pointerEvents = 'none';
+    }
   }, [map]);
   return null;
 }
@@ -519,224 +496,31 @@ function InvalidateMapSize({ trigger }: { trigger: any }) {
   return null;
 }
 
-// Helper to robustly resolve danger zone risk level from various fields set by the Admin Portal or app
-function resolveRiskLevel(zone: any): 'low' | 'moderate' | 'high' | 'critical' {
-  if (!zone) return 'moderate';
-
-  // 1. Check all potential database property keys that the Admin Portal might write
-  const rawValue = zone.riskLevel || zone.risk_level || zone.risk || zone.dangerLevel || zone.danger_level || zone.severity || zone.level || zone.category;
-  
-  if (rawValue !== undefined && rawValue !== null) {
-    const str = String(rawValue).trim().toLowerCase();
-    
-    // Low risk aliases
-    if (str === 'low' || str === 'safe' || str === '1' || str === 'green') {
-      return 'low';
-    }
-    // Moderate risk aliases
-    if (str === 'moderate' || str === 'medium' || str === 'yellow' || str === '2' || str === 'warning') {
-      return 'moderate';
-    }
-    // High risk aliases
-    if (str === 'high' || str === 'orange' || str === '3') {
-      return 'high';
-    }
-    // Critical risk aliases
-    if (str === 'critical' || str === 'danger' || str === 'red' || str === 'extreme' || str === '4') {
-      return 'critical';
-    }
-  }
-
-  // 2. Fallback to calculation based on radius if no field is present
-  const r = Number(zone.radius);
-  if (!isNaN(r)) {
-    if (r <= 60) return 'low';
-    if (r <= 120) return 'moderate';
-    if (r <= 170) return 'high';
-  }
-  
-  return 'critical';
-}
-
 export default function MapPage() {
   const darkMode = false;
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [permissionError, setPermissionError] = useState(false);
-  
-  // Dynamic route analytics and safety segmentation helper
-  const processRouteCoordinates = (coordinates: [number, number][], distance: number) => {
-    let routePenalty = 0;
-    let passesCritical = false;
-    let passesHigh = false;
-    let passesModerate = false;
-    let passesLow = false;
+  const [, setClockTick] = useState(0);
 
-    let approachesCritical = false;
-    let approachesHigh = false;
-    let approachesModerate = false;
-    let approachesLow = false;
+  // 1-minute clock tick to re-evaluate active time windows in real time while app is open
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClockTick(prev => prev + 1);
+    }, 60000);
+    return () => clearInterval(timer);
+  }, []);
 
-    zones.forEach(zone => {
-      if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
-      
-      // Find minimum exact distance from any route segment to this danger zone
-      let minDist = Infinity;
-      if (coordinates.length === 1) {
-        minDist = getDistanceMeters(coordinates[0][0], coordinates[0][1], zone.location.lat, zone.location.lng);
-      } else {
-        for (let i = 0; i < coordinates.length - 1; i++) {
-          const p1 = coordinates[i];
-          const p2 = coordinates[i + 1];
-          const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
-          if (d < minDist) {
-            minDist = d;
-          }
-        }
-      }
-
-      // Get risk level robustly from database values
-      const risk = resolveRiskLevel(zone);
-
-      // Assign heavier penalties so safe detours are prioritized over dangerous direct routes
-      if (minDist <= zone.radius) {
-        if (risk === 'critical') { passesCritical = true; routePenalty += 10000; }
-        else if (risk === 'high') { passesHigh = true; routePenalty += 5000; }
-        else if (risk === 'moderate') { passesModerate = true; routePenalty += 2000; }
-        else if (risk === 'low') { passesLow = true; routePenalty += 500; }
-      } else if (minDist <= zone.radius * 1.5) {
-        if (risk === 'critical') { approachesCritical = true; routePenalty += 2000; }
-        else if (risk === 'high') { approachesHigh = true; routePenalty += 1000; }
-        else if (risk === 'moderate') { approachesModerate = true; routePenalty += 400; }
-        else if (risk === 'low') { approachesLow = true; routePenalty += 100; }
-      }
-    });
-
-    const totalCost = distance + routePenalty;
-
-    // Calculate safety level
-    let safety: SafetyLevel = 'safe';
-    if (passesCritical || passesHigh || approachesCritical) {
-      safety = 'danger';
-    } else if (passesModerate || approachesHigh || passesLow) {
-      safety = 'moderate';
-    }
-
-    // Calculate safety score
-    let baseSafetyScore = 98;
-    if (passesCritical) baseSafetyScore -= 45;
-    else if (approachesCritical) baseSafetyScore -= 20;
-
-    if (passesHigh) baseSafetyScore -= 30;
-    else if (approachesHigh) baseSafetyScore -= 12;
-
-    if (passesModerate) baseSafetyScore -= 18;
-    else if (approachesModerate) baseSafetyScore -= 6;
-
-    if (passesLow) baseSafetyScore -= 10;
-    else if (approachesLow) baseSafetyScore -= 3;
-
-    const safetyScore = Math.max(50, Math.min(98, baseSafetyScore));
-
-    // 2. Generate visualization segments
-    const segments: { coordinates: [number, number][]; color: string; }[] = [];
-    let currentSegment: { coordinates: [number, number][]; color: string; } | null = null;
-
-    for (let i = 0; i < coordinates.length - 1; i++) {
-      const p1 = coordinates[i];
-      const p2 = coordinates[i+1];
-
-      let rank = 0; // Green
-      zones.forEach(zone => {
-        if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
-        
-        const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
-        const risk = resolveRiskLevel(zone);
-
-        if (d <= zone.radius) {
-          if (risk === 'critical' || risk === 'high') rank = Math.max(rank, 2); // Orange/High risk segment
-          else if (risk === 'moderate') rank = Math.max(rank, 1); // Yellow
-          else rank = Math.max(rank, 0); // Green
-        } else if (d <= zone.radius * 1.5) {
-          if (risk === 'critical' || risk === 'high') rank = Math.max(rank, 1); // Yellow for near approach
-        }
-      });
-
-      // Match exact colors: Low/Green `#10B981`, Moderate/Yellow `#F59E0B`, High/Orange `#F97316`
-      const colors = ['#10B981', '#F59E0B', '#F97316'];
-      const segColor = colors[rank];
-
-      if (!currentSegment) {
-        currentSegment = {
-          coordinates: [p1, p2],
-          color: segColor
-        };
-      } else if (currentSegment.color === segColor) {
-        currentSegment.coordinates.push(p2);
-      } else {
-        segments.push(currentSegment);
-        currentSegment = {
-          coordinates: [p1, p2],
-          color: segColor
-        };
-      }
-    }
-    if (currentSegment) {
-      segments.push(currentSegment);
-    }
-
-    return {
-      segments,
-      totalCost,
-      safety,
-      safetyScore
-    };
-  };
-
-  // Get danger zone rendering properties based on riskLevel and active status
-  const getDangerZoneSpecs = (zone: DangerZone) => {
-    const level = resolveRiskLevel(zone);
-
-    switch (level) {
-      case 'low':
-        return {
-          color: '#10B981',
-          label: '🟢 LOW RISK ZONE',
-          labelClass: 'text-emerald-600 font-bold',
-          fillOpacityGlow: 0.08,
-          fillOpacityPrecision: 0.20,
-          weight: 1,
-          dashArray: '3, 4'
-        };
-      case 'moderate':
-        return {
-          color: '#F59E0B',
-          label: '⚠️ MODERATE RISK ZONE',
-          labelClass: 'text-amber-500 font-bold',
-          fillOpacityGlow: 0.08,
-          fillOpacityPrecision: 0.22,
-          weight: 1,
-          dashArray: '3, 4'
-        };
-      case 'high':
-      case 'critical':
-      default:
-        return {
-          color: '#F97316',
-          label: '🚨 HIGH RISK ZONE',
-          labelClass: 'text-orange-600 font-bold',
-          fillOpacityGlow: 0.12,
-          fillOpacityPrecision: 0.25,
-          weight: 2,
-          dashArray: ''
-        };
-    }
-  };
-  
   // Navigation markers
   const [startPoint, setStartPoint] = useState<[number, number] | null>(null);
   const [endPoint, setEndPoint] = useState<[number, number] | null>(null);
   const [startQuery, setStartQuery] = useState('');
   const [endQuery, setEndQuery] = useState('');
+  const [isStartLinkedToGps, setIsStartLinkedToGps] = useState(false);
+  const [gpsStartNotice, setGpsStartNotice] = useState<{
+    message: string;
+    canOpenSettings?: boolean;
+    offerPickOnMap?: boolean;
+  } | null>(null);
   const [activeInputField, setActiveInputField] = useState<'start' | 'end' | null>(null);
   
   // Suggestion visibility
@@ -746,105 +530,146 @@ export default function MapPage() {
   // Route selection config
   const [routeProfile] = useState<'foot'>('foot');
   const [routes, setRoutes] = useState<CalculatedRoute[]>([]);
+  const [routeWarning, setRouteWarning] = useState<string | null>(null);
   const [activeRouteIndex, setActiveRouteIndex] = useState<number>(0);
   const [routeCalculated, setRouteCalculated] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [isCheckingSaferRoutes, setIsCheckingSaferRoutes] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const rawCandidatesRef = useRef<RawRouteCandidate[]>([]);
   
+  // Real-time caution area warning alert (independent of route results)
+  interface ActiveZoneAlert {
+    zoneId: string;
+    zoneTitle: string;
+    category: string;
+    incidentText: string;
+  }
+  const [activeZoneAlert, setActiveZoneAlert] = useState<ActiveZoneAlert | null>(null);
+  const [dismissedZoneId, setDismissedZoneId] = useState<string | null>(null);
+  const enteredZoneIdRef = useRef<string | null>(null);
+
   // Simulated navigation movement
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulatedIndex, setSimulatedIndex] = useState(0);
   const [currentLoc, setCurrentLoc] = useState<[number, number] | null>(null);
   const [proximityAlert, setProximityAlert] = useState<string | null>(null);
   const simulationTimer = useRef<NodeJS.Timeout | null>(null);
-  
-  // Real-Time Live GPS Pinpoint & Movement Tracking
-  const [liveGpsCoords, setLiveGpsCoords] = useState<[number, number] | null>(null);
-  const [liveGpsAccuracy, setLiveGpsAccuracy] = useState<number | null>(null);
-  const [liveGpsHeading, setLiveGpsHeading] = useState<number | null>(null);
-  const [liveGpsSpeed, setLiveGpsSpeed] = useState<number | null>(null);
-  const [autoFollowGps, setAutoFollowGps] = useState<boolean>(false);
-  const watchIdRef = useRef<number | null>(null);
 
-  // Continuous real-time GPS tracking listener
-  const hasInitiallyCentered = useRef(false);
+  // Simulated clock override (Strictly applied ONLY while isSimulating is TRUE)
+  // Selector options: 'now' (null) | '10pm' (22) | '2pm' (14) | 'custom' (customSimHour)
+  const [simClockMode, setSimClockMode] = useState<'now' | '10pm' | '2pm' | 'custom'>('now');
+  const [customSimHour, setCustomSimHour] = useState<number>(20);
+  const simulatedHour: number | null = isSimulating
+    ? (simClockMode === '10pm' ? 22 : simClockMode === '2pm' ? 14 : simClockMode === 'custom' ? customSimHour : null)
+    : null;
+  const currentSimHourRef = useRef<number | null>(null);
+  currentSimHourRef.current = simulatedHour;
+  
+  // Dynamic route analytics and safety segmentation helper (delegates to computeRouteZoneMetrics)
+  const processRouteCoordinates = (
+    coordinates: [number, number][], 
+    distance: number,
+    isSim: boolean = isSimulating,
+    simHour: number | null = simulatedHour
+  ) => {
+    return computeRouteZoneMetrics(coordinates, distance, distance / 1.3, zones, isSim, simHour);
+  };
+
+  // Get danger zone rendering properties based strictly on active time status (Single Color Rule)
+  // Feeds simulated clock strictly during simulation; real Manila time otherwise
+  const getDangerZoneSpecs = (zone: DangerZone) => {
+    const isNow = isZoneCurrentlyActive(zone, isSimulating, simulatedHour);
+    const styles = getZoneMapStyles(zone, isNow);
+    const timeText = formatActiveTimeWindow(zone);
+    const statusText = isNow 
+      ? 'Currently active' 
+      : (zone.activeTime === 'night_only' ? 'Caution at night only (Inactive right now)' : 'Inactive right now');
+
+    return {
+      color: ZONE_COLOR,
+      label: isNow ? '⚠️ CAUTION AREA' : `ℹ️ CAUTION AREA (${timeText})`,
+      labelClass: isNow ? 'text-orange-700 font-bold' : 'text-slate-600 font-bold',
+      statusText,
+      fillOpacityGlow: styles.fillOpacityGlow,
+      fillOpacityPrecision: styles.fillOpacityPrecision,
+      weight: styles.weight,
+      dashArray: styles.dashArray,
+      isNow
+    };
+  };
+  
+  // Unified single source of truth for location tracking
+  const {
+    position: userLocation,
+    accuracy: userAccuracy,
+    heading: userHeading,
+    speed: userSpeed,
+    status: gpsStatus,
+    isStale: isGpsStale,
+    isOutsidePalanan: isUserOutsidePalanan,
+    autoFollow: autoFollowGps,
+    setAutoFollow: setAutoFollowGps,
+    recenter: recenterGps,
+    requestPermission: requestGpsPermission,
+    openSettings: openGpsSettings,
+    setSimulatedOverride,
+    getFilteredPosition,
+  } = useLocationTracker();
+
+  // Synchronize simulator position override with location tracker
+  useEffect(() => {
+    if (isSimulating && currentLoc) {
+      setSimulatedOverride(currentLoc);
+    } else if (!isSimulating) {
+      setSimulatedOverride(null);
+    }
+  }, [isSimulating, currentLoc, setSimulatedOverride]);
+
+  // Keep startPoint synchronized with live position while linked to GPS before route generation
+  useEffect(() => {
+    if (isStartLinkedToGps && !routeCalculated && userLocation) {
+      setStartPoint(userLocation);
+    }
+  }, [isStartLinkedToGps, routeCalculated, userLocation]);
+
+  // Off-route detection state (user is > 50m from route start, OR > 40m from active route for >= 10 seconds)
+  const [isOffRoute, setIsOffRoute] = useState(false);
+  const [offRouteDistance, setOffRouteDistance] = useState<number>(0);
+  const offRouteTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
-    let isMounted = true;
-    let cleanupWatcher: (() => void) | null = null;
+    const activeRoute = routes[activeRouteIndex];
+    if (!activeRoute || !activeRoute.coordinates || activeRoute.coordinates.length < 2 || !userLocation) {
+      setIsOffRoute(false);
+      offRouteTimerRef.current = null;
+      return;
+    }
 
-    const onLocationUpdate = (pos: GpsLocationResult) => {
-      if (!isMounted) return;
-      const lat = pos.latitude;
-      const lng = pos.longitude;
-      const accuracy = pos.accuracy;
-      const heading = pos.heading;
-      const speed = pos.speed;
-
-      const newCoords: [number, number] = [lat, lng];
-      setLiveGpsCoords(newCoords);
-      setLiveGpsAccuracy(accuracy);
-      if (typeof heading === 'number' && !isNaN(heading)) {
-        setLiveGpsHeading(heading);
-      }
-      if (typeof speed === 'number' && !isNaN(speed)) {
-        setLiveGpsSpeed(speed);
-      }
-
-      // Check whether real-time GPS location is inside Barangay Palanan
-      const insidePalanan = isInsidePalanan(lat, lng);
-      setIsUserOutsidePalanan(!insidePalanan);
-
-      // Automatically center map on user on first GPS signal arrival or if autoFollowGps is active
-      if ((!hasInitiallyCentered.current || autoFollowGps) && mapRef.current) {
-        hasInitiallyCentered.current = true;
-        mapRef.current.setView(newCoords, 17, { animate: true });
-      }
-
-      // Check proximity to active danger zones in real-time
-      if (!isSimulating) {
-        let activeDangerMsg: string | null = null;
-        zones.forEach(zone => {
-          if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location) return;
-          const d = getDistanceMeters(lat, lng, zone.location.lat, zone.location.lng);
-          if (d <= zone.radius) {
-            activeDangerMsg = `PROXIMITY WARNING: Inside active threat zone: "${zone.description}".`;
-          } else if (d <= zone.radius * 1.4 && !activeDangerMsg) {
-            activeDangerMsg = `AWARENESS: Approaching hotspot: "${zone.description}" (${Math.round(d)}m away).`;
-          }
-        });
-        setProximityAlert(activeDangerMsg);
-      }
-    };
-
-    // Auto-request or check location permission on startup directly with native device dialog
-    checkLocationPermission().then((status) => {
-      if (!isMounted) return;
-      if (status === 'granted') {
-        getCurrentGpsPosition().then(onLocationUpdate).catch((e) => console.warn(e));
-      } else {
-        requestLocationPermission().then((granted) => {
-          if (granted && isMounted) {
-            getCurrentGpsPosition().then(onLocationUpdate).catch((e) => console.warn(e));
-          }
-        }).catch((e) => console.warn(e));
-      }
-    });
-
-    cleanupWatcher = watchGpsPosition(
-      onLocationUpdate,
-      (err) => {
-        console.warn("GPS tracking status:", err);
-      }
+    const distToRoute = getDistanceToRouteMeters(userLocation, activeRoute.coordinates);
+    const distToStart = getDistanceMeters(
+      userLocation[0],
+      userLocation[1],
+      activeRoute.coordinates[0][0],
+      activeRoute.coordinates[0][1]
     );
+    const displayDist = Math.round(Math.max(distToRoute, distToStart));
+    setOffRouteDistance(displayDist);
 
-    return () => {
-      isMounted = false;
-      if (cleanupWatcher) {
-        cleanupWatcher();
+    // Trigger recalculation prompt immediately if > 50m from trip start, or after 10s if > 40m off route
+    if (distToStart > 50) {
+      setIsOffRoute(true);
+    } else if (distToRoute > 40) {
+      if (!offRouteTimerRef.current) {
+        offRouteTimerRef.current = Date.now();
+      } else if (Date.now() - offRouteTimerRef.current >= 10000) {
+        setIsOffRoute(true);
       }
-    };
-  }, [autoFollowGps, zones, isSimulating]);
+    } else {
+      offRouteTimerRef.current = null;
+      setIsOffRoute(false);
+    }
+  }, [userLocation, routes, activeRouteIndex]);
 
   // Collapsible Bottom Sheet Expansion state
   const [isSheetExpanded, setIsSheetExpanded] = useState(false);
@@ -891,8 +716,7 @@ export default function MapPage() {
 
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
-  // Real-time Palanan boundary states for GPS location
-  const [isUserOutsidePalanan, setIsUserOutsidePalanan] = useState(false);
+  // Palanan boundary warning popup for manual triggers
   const [showOutsidePalananPopup, setShowOutsidePalananPopup] = useState(false);
 
   // Auto-dismiss toast after 4.5s
@@ -905,8 +729,8 @@ export default function MapPage() {
     }
   }, [toastMessage]);
 
-  // Active approved spots for public map view
-  const activeApprovedSpots = communitySpots.filter(s => s && s.active && s.status !== 'pending');
+  // Active approved spots for public map view and panel count badge
+  const activeApprovedSpots = communitySpots.filter(isSpotVisibleOnMap);
 
   // Load and subscribe to Saved Places
   useEffect(() => {
@@ -957,93 +781,6 @@ export default function MapPage() {
     return () => unsubscribe();
   }, [user]);
 
-  // One-time database cleanup to remove generated default danger zones and school/hospital/office saved places
-  useEffect(() => {
-    const performCleanup = async () => {
-      // In Demo Mode (Guest), do not modify or delete official danger zones or saved records
-      if (isDemo) return;
-
-      try {
-        // 1. Clean up default danger zones (where addedBy === 'admin')
-        const qZones = collection(db, 'danger_zones');
-        const snapZones = await getDocs(qZones);
-        snapZones.forEach(async (docSnap) => {
-          const data = docSnap.data();
-          if (data.addedBy === 'admin') {
-            await deleteDoc(doc(db, 'danger_zones', docSnap.id));
-          }
-        });
-
-        const qZonesDouble = collection(db, 'danger__zones');
-        const snapZonesDouble = await getDocs(qZonesDouble);
-        snapZonesDouble.forEach(async (docSnap) => {
-          const data = docSnap.data();
-          if (data.addedBy === 'admin') {
-            await deleteDoc(doc(db, 'danger__zones', docSnap.id));
-          }
-        });
-
-        // 2. Clean up seed-home, school, office (work), hospital saved places for the logged-in user or guest
-        const uid = user ? user.uid : 'guest';
-        const qPlaces = query(collection(db, 'saved_places'), where('userId', '==', uid));
-        const snapPlaces = await getDocs(qPlaces);
-        snapPlaces.forEach(async (docSnap) => {
-          const data = docSnap.data();
-          const name = String(data.name || '').toLowerCase();
-          const category = String(data.category || '').toLowerCase();
-          if (
-            category === 'school' || 
-            category === 'work' || 
-            category === 'hospital' ||
-            name.includes('school') ||
-            name.includes('office') ||
-            name.includes('hospital') ||
-            docSnap.id === 'seed-home' ||
-            docSnap.id === 'seed-school' ||
-            docSnap.id === 'seed-work' ||
-            docSnap.id === 'seed-hospital' ||
-            name === 'my home 🏠' ||
-            (data.location?.lat === 14.56200 && data.location?.lng === 120.99845)
-          ) {
-            await deleteDoc(doc(db, 'saved_places', docSnap.id));
-          }
-        });
-
-        // Also clean up local guest seed places
-        const local = localStorage.getItem('saved_places_guest');
-        if (local) {
-          try {
-            const parsed = JSON.parse(local) as SavedPlace[];
-            const cleaned = parsed.filter(p => {
-              const name = String(p.name || '').toLowerCase();
-              const cat = String(p.category || '').toLowerCase();
-              return !(
-                cat === 'school' ||
-                cat === 'work' ||
-                cat === 'hospital' ||
-                name.includes('school') ||
-                name.includes('office') ||
-                name.includes('hospital') ||
-                p.id === 'seed-home' ||
-                p.id === 'seed-school' ||
-                p.id === 'seed-work' ||
-                p.id === 'seed-hospital' ||
-                name === 'my home 🏠' ||
-                (p.location?.lat === 14.56200 && p.location?.lng === 120.99845)
-              );
-            });
-            localStorage.setItem('saved_places_guest', JSON.stringify(cleaned));
-          } catch (e) {
-            console.error(e);
-          }
-        }
-      } catch (error) {
-        console.error("Error running database cleanup:", error);
-      }
-    };
-
-    performCleanup();
-  }, [user]);
 
   // Ref hook to trigger custom map viewport action hooks
   const mapRef = useRef<L.Map | null>(null);
@@ -1057,10 +794,34 @@ export default function MapPage() {
       rawZones1.forEach(z => mergedMap.set(z.id, z));
       rawZones2.forEach(z => mergedMap.set(z.id, z));
       
-      // Filter out any danger zones marked as resolved or inactive
-      const combined = Array.from(mergedMap.values()).filter(
-        z => z && z.location && typeof z.location.lat === 'number' && typeof z.location.lng === 'number' && !isZoneResolved(z) && z.active !== false
-      );
+      // Filter out any danger zones marked as resolved, inactive, needsLocation, missing/zero coords, or outside bounds
+      const combined: DangerZone[] = [];
+      for (const z of mergedMap.values()) {
+        if (!z) continue;
+        if (z.active === false) {
+          console.warn(`[DangerZone] Skipped zone "${z.id}": inactive`);
+          continue;
+        }
+        if (isZoneResolved(z)) {
+          console.warn(`[DangerZone] Skipped zone "${z.id}": resolved`);
+          continue;
+        }
+        if (z.needsLocation) {
+          console.warn(`[DangerZone] Skipped zone "${z.id}": needsLocation`);
+          continue;
+        }
+        const lat = z.location?.lat;
+        const lng = z.location?.lng;
+        if (typeof lat !== 'number' || typeof lng !== 'number' || isNaN(lat) || isNaN(lng) || (lat === 0 && lng === 0)) {
+          console.warn(`[DangerZone] Skipped zone "${z.id}": bad coordinates (${lat}, ${lng})`);
+          continue;
+        }
+        if (!isInsidePalanan(lat, lng)) {
+          console.warn(`[DangerZone] Skipped zone "${z.id}": out of bounds (${lat}, ${lng})`);
+          continue;
+        }
+        combined.push(z);
+      }
       setZones(combined);
     };
     
@@ -1071,21 +832,10 @@ export default function MapPage() {
         rawZones1 = snapshot.docs.map(docSnap => {
           const data = docSnap.data();
           const loc = safeGetCoords(data);
-          const isResolved = isZoneResolved(data);
-          const active = !isResolved && (
-            data.active !== undefined 
-              ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-              : (data.status === 'active' || data.status === 'approved' || !data.status)
-          );
-          const radius = Number(data.radius) || 100;
-          return {
-            id: docSnap.id,
-            ...data,
-            location: loc,
-            radius,
-            active,
-            resolved: isResolved
-          } as DangerZone;
+          if (!loc) {
+            return normalizeDangerZone({ ...data, id: docSnap.id, needsLocation: true, active: false, isResolved: true });
+          }
+          return normalizeDangerZone({ ...data, id: docSnap.id, location: loc, latitude: loc.lat, longitude: loc.lng });
         });
         updateMergedZones();
       },
@@ -1103,21 +853,10 @@ export default function MapPage() {
         rawZones2 = snapshot.docs.map(docSnap => {
           const data = docSnap.data();
           const loc = safeGetCoords(data);
-          const isResolved = isZoneResolved(data);
-          const active = !isResolved && (
-            data.active !== undefined 
-              ? (typeof data.active === 'string' ? data.active === 'true' : !!data.active) 
-              : (data.status === 'active' || data.status === 'approved' || !data.status)
-          );
-          const radius = Number(data.radius) || 100;
-          return {
-            id: docSnap.id,
-            ...data,
-            location: loc,
-            radius,
-            active,
-            resolved: isResolved
-          } as DangerZone;
+          if (!loc) {
+            return normalizeDangerZone({ ...data, id: docSnap.id, needsLocation: true, active: false, isResolved: true });
+          }
+          return normalizeDangerZone({ ...data, id: docSnap.id, location: loc, latitude: loc.lat, longitude: loc.lng });
         });
         updateMergedZones();
       },
@@ -1149,18 +888,15 @@ export default function MapPage() {
             const data = docSnap.data();
             const title = (data.title || '').trim();
             if (generatedTitles.includes(title) || docSnap.id.startsWith('spot-dian') || docSnap.id.startsWith('spot-edison') || docSnap.id.startsWith('spot-filmore') || docSnap.id.startsWith('spot-marconi') || docSnap.id.startsWith('spot-bautista')) {
-              // Delete generated seed spots from Firestore
-              deleteDoc(doc(db, 'community_spots', docSnap.id)).catch(() => {});
+              // Ignore legacy generated seed spots in memory (never delete from database)
               return;
             }
             const loc = safeGetCoords(data);
             if (!loc) return;
 
-            // Clean up duplicates by title and coordinates
+            // In-memory deduplication by title and coordinates (never delete from database)
             const dupKey = `${title.toLowerCase()}_${loc.lat.toFixed(5)}_${loc.lng.toFixed(5)}`;
             if (seenKeys.has(dupKey)) {
-              deleteDoc(doc(db, 'community_spots', docSnap.id)).catch(() => {});
-              try { deleteDoc(doc(db, 'communitySpots', docSnap.id)).catch(() => {}); } catch(e){}
               return;
             }
             seenKeys.add(dupKey);
@@ -1214,13 +950,40 @@ export default function MapPage() {
 
   // Sync human-readable street names for inputs
   useEffect(() => {
+    if (isStartLinkedToGps) {
+      setStartQuery('My location');
+      return;
+    }
     if (startPoint && typeof startPoint[0] === 'number' && typeof startPoint[1] === 'number') {
       const match = PALANAN_PLACES.find(p => p.latLng && p.latLng[0] === startPoint[0] && p.latLng[1] === startPoint[1]);
       setStartQuery(match ? match.name : `Map Point [${startPoint[0].toFixed(4)}, ${startPoint[1].toFixed(4)}]`);
     } else {
       setStartQuery('');
     }
-  }, [startPoint]);
+  }, [startPoint, isStartLinkedToGps]);
+
+  // Default start to "My location" when destination is set and start is empty
+  useEffect(() => {
+    if (endPoint && !startPoint) {
+      getRouteStartFromGps({ waitForFix: false }).then((res) => {
+        if (res.success) {
+          setStartPoint(res.point);
+          setIsStartLinkedToGps(true);
+          setStartQuery('My location');
+          setGpsStartNotice(null);
+          if (res.notice) {
+            setRouteWarning(res.notice);
+          }
+        } else {
+          setGpsStartNotice({
+            message: res.message,
+            canOpenSettings: res.canOpenSettings,
+            offerPickOnMap: res.offerPickOnMap,
+          });
+        }
+      });
+    }
+  }, [endPoint, startPoint]);
 
   useEffect(() => {
     if (endPoint && typeof endPoint[0] === 'number' && typeof endPoint[1] === 'number') {
@@ -1249,68 +1012,116 @@ export default function MapPage() {
     }
   };
 
-  // Safe Grid backup generator to avoid diagonal floating lines
-  const generateBackupGridPaths = (start: [number, number], end: [number, number]): CalculatedRoute[] => {
-    const lat1 = start[0];
-    const lng1 = start[1];
-    const lat2 = end[0];
-    const lng2 = end[1];
+  // Real-time caution area warning popup check (independent of routing results)
+  useEffect(() => {
+    const effectivePos = isSimulating && currentLoc ? currentLoc : userLocation;
+    if (!effectivePos) return;
 
-    const coords1: [number, number][] = [];
-    const segments = 15;
-    for (let i = 0; i <= segments; i++) {
-      coords1.push([lat1, lng1 + (lng2 - lng1) * (i / segments)]);
-    }
-    for (let i = 0; i <= segments; i++) {
-      coords1.push([lat1 + (lat2 - lat1) * (i / segments), lng2]);
+    // Signal quality: do not fire caution popup on weak GPS fix (> 50m) when not simulating
+    if (!isSimulating && (gpsStatus === 'weak' || (userAccuracy !== null && userAccuracy > 50))) {
+      return;
     }
 
-    const coords2: [number, number][] = [];
-    for (let i = 0; i <= segments; i++) {
-      coords2.push([lat1 + (lat2 - lat1) * (i / segments), lng1]);
-    }
-    for (let i = 0; i <= segments; i++) {
-      coords2.push([lat2, lng1 + (lng2 - lng1) * (i / segments)]);
-    }
+    const [lat, lng] = effectivePos;
 
-    const dist1 = getDistanceMeters(lat1, lng1, lat2, lng2) * 1.25;
-    const dist2 = getDistanceMeters(lat1, lng1, lat2, lng2) * 1.40;
+    const activeNow = zones.filter(z =>
+      z && !isZoneResolved(z) && z.active !== false && z.location &&
+      typeof z.location.lat === 'number' && typeof z.location.lng === 'number' &&
+      isZoneCurrentlyActive(z, isSimulating, currentSimHourRef.current)
+    );
 
-    const route1Stats = processRouteCoordinates(coords1, dist1);
-    const route2Stats = processRouteCoordinates(coords2, dist2);
-
-    return [
-      {
-        coordinates: coords1,
-        distance: dist1,
-        duration: dist1 / 1.3,
-        name: "Palanan Grid Way (Shortest Road Snap)",
-        safety: route1Stats.safety,
-        safetyScore: route1Stats.safetyScore,
-        totalCost: route1Stats.totalCost,
-        segments: route1Stats.segments,
-        steps: [
-          { instruction: "Walk East along Palanan Residencia avenue", distance: dist1 * 0.45, name: "Palanan St" },
-          { instruction: "Turn Right near the lighted residential corners", distance: dist1 * 0.55, name: "Bautista St" },
-          { instruction: "Arrived safely inside Palanan bounds.", distance: 0, name: "Destination" }
-        ]
-      },
-      {
-        coordinates: coords2,
-        distance: dist2,
-        duration: dist2 / 1.3,
-        name: "Dian Bypass Route (Safest Detour)",
-        safety: route2Stats.safety,
-        safetyScore: route2Stats.safetyScore,
-        totalCost: route2Stats.totalCost,
-        segments: route2Stats.segments,
-        steps: [
-          { instruction: "Head South towards Marconi Street", distance: dist2 * 0.5, name: "Marconi St" },
-          { instruction: "Take safe turn past St. Clare's medical center", distance: dist2 * 0.5, name: "Dian St" },
-          { instruction: "Reached final local address location safely.", distance: 0, name: "Destination" }
-        ]
+    let insideZone: DangerZone | null = null;
+    for (const z of activeNow) {
+      const d = getDistanceMeters(lat, lng, z.location.lat, z.location.lng);
+      if (d <= z.radius) {
+        insideZone = z;
+        break;
       }
-    ];
+    }
+
+    if (insideZone) {
+      if (enteredZoneIdRef.current !== insideZone.id) {
+        enteredZoneIdRef.current = insideZone.id;
+        setDismissedZoneId(null);
+
+        const totalIncidents = insideZone.crimeCount || 0;
+        const period = insideZone.dataPeriod?.trim();
+        const incidentText = totalIncidents > 0 && period
+          ? `${totalIncidents} recorded incident${totalIncidents === 1 ? '' : 's'} (${period})`
+          : totalIncidents > 0
+          ? `${totalIncidents} recorded incident${totalIncidents === 1 ? '' : 's'}`
+          : 'No incident count recorded';
+
+        // Use softer wording when accuracy is between 40m and 50m
+        const isBorderlineAccurate = !isSimulating && userAccuracy !== null && userAccuracy > 40 && userAccuracy <= 50;
+        const baseTitle = insideZone.description || (insideZone as any).title || insideZone.locationName || 'Caution Area';
+        const zoneTitle = isBorderlineAccurate
+          ? `You may be near a caution area: ${baseTitle}`
+          : baseTitle;
+
+        setActiveZoneAlert({
+          zoneId: insideZone.id,
+          zoneTitle,
+          category: insideZone.category || 'General Risk',
+          incidentText
+        });
+        playAlertBuzzer();
+      }
+    } else {
+      // 15 m exit buffer before re-triggering (hysteresis)
+      if (enteredZoneIdRef.current) {
+        const prevZone = zones.find(z => z.id === enteredZoneIdRef.current);
+        if (prevZone && prevZone.location) {
+          const d = getDistanceMeters(lat, lng, prevZone.location.lat, prevZone.location.lng);
+          if (d > prevZone.radius + 15) {
+            enteredZoneIdRef.current = null;
+            setDismissedZoneId(null);
+            setActiveZoneAlert(null);
+          }
+        } else {
+          enteredZoneIdRef.current = null;
+          setDismissedZoneId(null);
+          setActiveZoneAlert(null);
+        }
+      }
+    }
+  }, [currentLoc, userLocation, isSimulating, zones, gpsStatus, userAccuracy]);
+
+  // Demo trip query parameter (?demo=true) and custom event listener
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('demo') === 'true' || params.get('demo') === '1') {
+        loadDemoRoute();
+      }
+
+      const handleDemoEvent = () => loadDemoRoute();
+      window.addEventListener('load-demo-trip', handleDemoEvent);
+      return () => window.removeEventListener('load-demo-trip', handleDemoEvent);
+    }
+  }, [zones]);
+
+
+
+
+  // Hidden demo-trip loader (Fixed Palanan trip: [14.55915, 120.99920] to [14.55565, 120.99920])
+  const loadDemoRoute = () => {
+    const demoStart: [number, number] = [14.55915, 120.99920];
+    const demoEnd: [number, number] = [14.55565, 120.99920];
+    setStartPoint(demoStart);
+    setStartQuery('Demo Origin [14.55915, 120.99920]');
+    setEndPoint(demoEnd);
+    setEndQuery('Demo Destination [14.55565, 120.99920]');
+    setErrorMessage(null);
+    setRouteWarning(null);
+
+    const demoRes = getDemoTripSavedRoutes(zones, isSimulating, currentSimHourRef.current);
+    rawCandidatesRef.current = demoRes.rawCandidates || [];
+    setRoutes(demoRes.routes);
+    setRouteWarning(demoRes.statusMessage || null);
+    setActiveRouteIndex(0);
+    setRouteCalculated(true);
+    setIsSheetExpanded(true);
   };
 
   // Perform road snapped calculations
@@ -1321,327 +1132,111 @@ export default function MapPage() {
     }
 
     setLoading(true);
+    setIsCheckingSaferRoutes(true);
     setErrorMessage(null);
+    setRouteWarning(null);
     setProximityAlert(null);
     setIsSimulating(false);
     if (simulationTimer.current) clearInterval(simulationTimer.current);
 
-    const fetchRouteWithWaypoints = async (
-      start: [number, number],
-      waypoints: [number, number][],
-      end: [number, number],
-      routeName = "🛡️ Safe Detour Route"
-    ): Promise<CalculatedRoute | null> => {
-      const cacheKey = getRouteCacheKey(start, waypoints, end);
-      if (globalRouteCache.has(cacheKey)) {
-        const cached = globalRouteCache.get(cacheKey);
-        const stats = processRouteCoordinates(cached.coordinates, cached.distance);
-        return {
-          ...cached,
-          safety: stats.safety,
-          safetyScore: stats.safetyScore,
-          totalCost: stats.totalCost,
-          segments: stats.segments,
-          name: routeName
-        };
+    const onProgress = (partial: any) => {
+      if (partial.routes && partial.routes.length > 0) {
+        setRoutes(partial.routes);
+        setRouteCalculated(true);
+        setIsSheetExpanded(true);
+        setActiveRouteIndex(prev => (prev < partial.routes.length ? prev : 0));
       }
-
-      try {
-        const allPoints = [start, ...waypoints, end];
-        const coordsString = allPoints.map(p => `${p[1]},${p[0]}`).join(';');
-        const osmDeUrl = `https://routing.openstreetmap.de/routed-foot/route/v1/foot/${coordsString}?overview=full&geometries=geojson&steps=true`;
-        
-        let data = await fetchRouteJsonWithTimeout(osmDeUrl, 3500);
-        
-        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-          const fallbackUrl = `https://router.project-osrm.org/route/v1/foot/${coordsString}?overview=full&geometries=geojson&steps=true`;
-          data = await fetchRouteJsonWithTimeout(fallbackUrl, 3500);
-        }
-        
-        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) return null;
-        
-        const route = data.routes[0];
-        let coordinates: [number, number][] = route.geometry.coordinates.map((coord: [number, number]) => [coord[1], coord[0]] as [number, number]);
-        
-        // Remove dead-end spur backtracking
-        if (coordinates.length >= 3) {
-          const cleaned: [number, number][] = [coordinates[0]];
-          for (let i = 1; i < coordinates.length; i++) {
-            const curr = coordinates[i];
-            if (cleaned.length >= 2) {
-              const prevPrev = cleaned[cleaned.length - 2];
-              if (getDistanceMeters(curr[0], curr[1], prevPrev[0], prevPrev[1]) < 12) {
-                cleaned.pop();
-                continue;
-              }
-            }
-            cleaned.push(curr);
-          }
-          coordinates = cleaned;
-        }
-
-        const steps = route.legs?.flatMap((leg: any) => leg.steps || [])?.map((step: any) => ({
-          instruction: step.maneuver?.instruction || "Continue ahead",
-          distance: step.distance || 0,
-          name: step.name || "Street Path"
-        })) || [];
-        
-        const stats = processRouteCoordinates(coordinates, route.distance);
-        const result: CalculatedRoute = {
-          coordinates,
-          distance: route.distance,
-          duration: route.duration,
-          steps,
-          safety: stats.safety,
-          safetyScore: stats.safetyScore,
-          totalCost: stats.totalCost,
-          segments: stats.segments,
-          name: routeName
-        };
-
-        globalRouteCache.set(cacheKey, result);
-        return result;
-      } catch (err) {
-        console.warn("Detour waypoint calculation skipped:", err);
-        return null;
+      if (partial.statusMessage) {
+        setRouteWarning(partial.statusMessage);
       }
     };
 
     try {
-      const directCacheKey = getRouteCacheKey(currentStart, [], currentEnd);
-      let data: any = null;
+      const result = await generateSuggestedRoutes(
+        currentStart,
+        currentEnd,
+        zones,
+        isSimulating,
+        currentSimHourRef.current,
+        undefined,
+        onProgress,
+        { isCurrentLocation: isStartLinkedToGps }
+      );
 
-      if (globalRouteCache.has(directCacheKey)) {
-        const cached = globalRouteCache.get(directCacheKey);
-        data = { code: 'Ok', routes: [{ geometry: { coordinates: cached.coordinates.map((c: [number, number]) => [c[1], c[0]]) }, distance: cached.distance, duration: cached.duration, legs: [{ steps: cached.steps }] }] };
-      } else {
-        // Prioritize the dedicated pedestrian/foot routing server from the OSM Germany community
-        const osmDeUrl = `https://routing.openstreetmap.de/routed-foot/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
-        data = await fetchRouteJsonWithTimeout(osmDeUrl, 3500);
+      rawCandidatesRef.current = result.rawCandidates || [];
 
-        if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
-          const fallbackOsrmUrl = `https://router.project-osrm.org/route/v1/foot/${currentStart[1]},${currentStart[0]};${currentEnd[1]},${currentEnd[0]}?overview=full&geometries=geojson&steps=true&alternatives=true`;
-          data = await fetchRouteJsonWithTimeout(fallbackOsrmUrl, 3500);
-        }
-      }
-
-      if (!data || data.code !== 'Ok' || !data.routes || data.routes.length === 0) {
+      if (!result.routes || result.routes.length === 0) {
         throw new Error("No network road path available between selected points.");
       }
 
-      const calculated: CalculatedRoute[] = data.routes.map((route: any) => {
-        const coordinates: [number, number][] = route.geometry.coordinates.map((coord: [number, number]) => [coord[1], coord[0]] as [number, number]);
-        const steps = route.legs?.[0]?.steps?.map((step: any) => ({
-          instruction: step.maneuver?.instruction || "Continue ahead",
-          distance: step.distance || 0,
-          name: step.name || "Street Path"
-        })) || [];
-
-        // Apply our centralized routing and risk analytics processor
-        const stats = processRouteCoordinates(coordinates, route.distance);
-
-        return {
-          coordinates,
-          distance: route.distance,
-          duration: route.duration,
-          steps,
-          safety: stats.safety,
-          safetyScore: stats.safetyScore,
-          totalCost: stats.totalCost,
-          segments: stats.segments,
-          name: "Direct Route"
-        };
-      });
-
-      // --- DYNAMIC DETOUR GENERATION LOGIC ---
-      // Strictly ignore danger zones that are marked as resolved or inactive
-      const activeZones = zones.filter(zone => zone && !isZoneResolved(zone) && zone.active !== false && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number');
-      const validDetours: CalculatedRoute[] = [];
-      
-      const intersectingZones = activeZones.filter(zone => {
-        return calculated.some(route => {
-          if (!route.coordinates || route.coordinates.length < 2) return false;
-          for (let i = 0; i < route.coordinates.length - 1; i++) {
-            const p1 = route.coordinates[i];
-            const p2 = route.coordinates[i + 1];
-            const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
-            if (d <= zone.radius * 1.05) return true;
-          }
-          return false;
-        });
-      });
-
-      if (intersectingZones.length > 0) {
-        const detourPromises: Promise<CalculatedRoute | null>[] = [];
-
-        // Limit detour query volume to avoid rate limiting on mobile APK
-        intersectingZones.slice(0, 2).forEach(zone => {
-          const latDegreeMeters = 111000;
-          const lngDegreeMeters = 111000 * Math.cos(zone.location.lat * Math.PI / 180);
-          const shiftMeters = Math.max(zone.radius + 35, 75);
-
-          const shiftLat = shiftMeters / latDegreeMeters;
-          const shiftLng = shiftMeters / lngDegreeMeters;
-
-          // Lateral Waypoints (North-East, South-West bypasses) around threat zone
-          const wayNorth: [number, number] = [zone.location.lat + shiftLat, zone.location.lng];
-          const waySouth: [number, number] = [zone.location.lat - shiftLat, zone.location.lng];
-          const wayEast: [number, number] = [zone.location.lat, zone.location.lng + shiftLng];
-          const wayWest: [number, number] = [zone.location.lat, zone.location.lng - shiftLng];
-
-          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayNorth], currentEnd, "🛡️ Safe Detour via Calatagan St"));
-          detourPromises.push(fetchRouteWithWaypoints(currentStart, [waySouth], currentEnd, "🛡️ Safe Detour (South Corridor)"));
-          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayEast], currentEnd, "🛡️ Safe Detour (East Bypass)"));
-          detourPromises.push(fetchRouteWithWaypoints(currentStart, [wayWest], currentEnd, "🛡️ Safe Detour (West Bypass)"));
-        });
-
-        const detourResults = await Promise.all(detourPromises);
-
-        // STRICT FILTERING: Only accept detour routes that NEVER enter the danger zone and have superior safety
-        detourResults.forEach(detour => {
-          if (!detour || !detour.coordinates || detour.coordinates.length < 2) return;
-
-          // Check if any segment crosses inside any threat circle
-          let crossesInside = false;
-          for (const zone of activeZones) {
-            for (let i = 0; i < detour.coordinates.length - 1; i++) {
-              const p1 = detour.coordinates[i];
-              const p2 = detour.coordinates[i + 1];
-              const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
-              if (d <= zone.radius * 0.95) {
-                crossesInside = true;
-                break;
-              }
-            }
-            if (crossesInside) break;
-          }
-
-          if (crossesInside) return; // Discard routes that cut through danger zones!
-          if (detour.safety === 'danger') return; // Discard dangerous detours!
-
-          // Deduplicate
-          const isDup = validDetours.some(v => Math.abs(v.distance - detour.distance) < 20 && v.safetyScore === detour.safetyScore);
-          if (!isDup) {
-            validDetours.push(detour);
-          }
-        });
-
-        // If OSRM failed to produce an off-circle road route, construct an orthogonal safe grid detour as fallback
-        if (validDetours.length === 0 && intersectingZones.length > 0) {
-          intersectingZones.forEach(zone => {
-            const bufferMeters = zone.radius + 35;
-            const latDeg = bufferMeters / 111000;
-            const lngDeg = bufferMeters / (111000 * Math.cos(zone.location.lat * Math.PI / 180));
-
-            const northLat = zone.location.lat + latDeg;
-            const southLat = zone.location.lat - latDeg;
-
-            const gridNorth: [number, number][] = [
-              currentStart,
-              [northLat, currentStart[1]],
-              [northLat, currentEnd[1]],
-              currentEnd
-            ];
-
-            const gridSouth: [number, number][] = [
-              currentStart,
-              [southLat, currentStart[1]],
-              [southLat, currentEnd[1]],
-              currentEnd
-            ];
-
-            [gridNorth, gridSouth].forEach((gridCoords, i) => {
-              const dist = getDistanceMeters(currentStart[0], currentStart[1], gridCoords[1][0], gridCoords[1][1]) +
-                           getDistanceMeters(gridCoords[1][0], gridCoords[1][1], gridCoords[2][0], gridCoords[2][1]) +
-                           getDistanceMeters(gridCoords[2][0], gridCoords[2][1], currentEnd[0], currentEnd[1]);
-
-              const stats = processRouteCoordinates(gridCoords, dist);
-              if (stats.safety === 'safe') {
-                validDetours.push({
-                  coordinates: gridCoords,
-                  distance: dist,
-                  duration: dist / 1.3,
-                  steps: [
-                    { instruction: "Walk via Calatagan Street safe corridor", distance: dist * 0.5, name: "Calatagan St" },
-                    { instruction: "Turn towards destination along safe path", distance: dist * 0.5, name: "Marconi St" }
-                  ],
-                  safety: stats.safety,
-                  safetyScore: stats.safetyScore,
-                  totalCost: stats.totalCost,
-                  segments: stats.segments,
-                  name: `🛡️ Safe Grid Detour ${i + 1} (Calatagan St Bypass)`
-                });
-              }
-            });
-          });
-        }
-      }
-      // --- END OF DYNAMIC DETOUR LOGIC ---
-
-      // Separate direct route (primary OSRM route)
-      const directRoute = calculated[0];
-      if (directRoute) {
-        if (directRoute.safety === 'safe') {
-          directRoute.name = "Direct Walk (Shortest & Safe)";
-        } else if (directRoute.safety === 'moderate') {
-          directRoute.name = "Direct Walk (Crosses Moderate Risk Zone)";
-        } else {
-          directRoute.name = "Direct Walk (Crosses Active Threat Zone)";
-        }
-      }
-
-      // Filter and deduplicate valid detours to keep only distinct, unique options (max 2)
-      const distinctDetours: CalculatedRoute[] = [];
-      validDetours.sort((a, b) => a.distance - b.distance);
-
-      for (const detour of validDetours) {
-        // Skip if distance is almost identical (< 35m difference) to an already selected detour
-        const isSimilar = distinctDetours.some(d => Math.abs(d.distance - detour.distance) < 35);
-        if (!isSimilar) {
-          distinctDetours.push(detour);
-        }
-        if (distinctDetours.length >= 2) break; // Maximum 2 distinct safe detours
-      }
-
-      // Format names for distinct safe detours
-      distinctDetours.forEach((detour, idx) => {
-        if (idx === 0) {
-          detour.name = detour.name.includes("Calatagan")
-            ? "🛡️ Safe Detour via Calatagan St (RECOMMENDED)"
-            : "🛡️ Safe Detour Route (RECOMMENDED)";
-        } else {
-          detour.name = "🛡️ Alternate Safe Detour";
-        }
-      });
-
-      // Construct clean final list: [Direct Walk, Safe Detour 1, Safe Detour 2 (if distinct)]
-      const finalRoutes: CalculatedRoute[] = [];
-      if (directRoute) {
-        finalRoutes.push(directRoute);
-      }
-      distinctDetours.forEach(d => finalRoutes.push(d));
-
-      // Default active selection: Recommend the Safe Detour (Index 1) if direct route passes danger zone
-      const defaultActiveIndex = (directRoute && directRoute.safety !== 'safe' && distinctDetours.length > 0) ? 1 : 0;
-
-      setRoutes(finalRoutes);
-      setActiveRouteIndex(defaultActiveIndex);
+      setRoutes(result.routes);
+      setRouteWarning(result.statusMessage || result.warning || null);
+      setActiveRouteIndex(prev => (prev < result.routes.length ? prev : 0));
       setRouteCalculated(true);
-      setIsSheetExpanded(true); // Auto expand to show metrics instantly
+      setIsSheetExpanded(true);
+    } catch (err: any) {
+      console.warn("Unable to fetch routing from service:", err);
+      const isDemoCoords =
+        Math.abs(currentStart[0] - 14.55915) < 0.001 &&
+        Math.abs(currentStart[1] - 120.99920) < 0.001 &&
+        Math.abs(currentEnd[0] - 14.55565) < 0.001 &&
+        Math.abs(currentEnd[1] - 120.99920) < 0.001;
 
-    } catch (err) {
-      console.warn("Unable to connect to dynamic public OSRM. Snapping backup orthogonal street grid:", err);
-      const fallback = generateBackupGridPaths(currentStart, currentEnd);
-      
-      // Sort backup grid paths as well
-      fallback.sort((a, b) => a.totalCost - b.totalCost);
-      
-      setRoutes(fallback);
-      setActiveRouteIndex(0);
-      setRouteCalculated(true);
-      setIsSheetExpanded(true); // Auto expand
+      if (isDemoCoords) {
+        const demoRes = getDemoTripSavedRoutes(zones, isSimulating, currentSimHourRef.current);
+        setRoutes(demoRes.routes);
+        setRouteWarning(demoRes.statusMessage || null);
+        setActiveRouteIndex(0);
+        setRouteCalculated(true);
+        setIsSheetExpanded(true);
+      } else {
+        setErrorMessage("Couldn't get a walking route. Check your connection and try again.");
+        setRoutes(prevRoutes => (prevRoutes && prevRoutes.length > 0 ? prevRoutes : []));
+      }
     } finally {
       setLoading(false);
+      setIsCheckingSaferRoutes(false);
+    }
+  };
+
+  // Retry button handler: resumes only the unfinished safer route search and keeps shown routes
+  const handleRetrySaferSearch = async () => {
+    if (!startPoint || !endPoint || isCheckingSaferRoutes) return;
+    setIsCheckingSaferRoutes(true);
+    setErrorMessage(null);
+    setRouteWarning(null);
+
+    const onProgress = (partial: any) => {
+      if (partial.routes && partial.routes.length > 0) {
+        setRoutes(partial.routes);
+        setRouteCalculated(true);
+        setIsSheetExpanded(true);
+        setActiveRouteIndex(prev => (prev < partial.routes.length ? prev : 0));
+      }
+      if (partial.statusMessage) {
+        setRouteWarning(partial.statusMessage);
+      }
+    };
+
+    try {
+      const result = await generateSuggestedRoutes(
+        startPoint,
+        endPoint,
+        zones,
+        isSimulating,
+        currentSimHourRef.current,
+        undefined,
+        onProgress,
+        { forceRetry: true }
+      );
+      if (result.routes && result.routes.length > 0) {
+        setRoutes(result.routes);
+      }
+      setRouteWarning(result.statusMessage || result.warning || null);
+    } catch (err: any) {
+      console.warn("Retry failed:", err);
+    } finally {
+      setIsCheckingSaferRoutes(false);
     }
   };
 
@@ -1650,6 +1245,10 @@ export default function MapPage() {
     if (isSimulating) return;
 
     if (isPickingSpotOnMap) {
+      if (!isInsidePalanan(latLng[0], latLng[1])) {
+        setToastMessage('⚠️ Location is outside Barangay Palanan. Please pinpoint a location within the barangay boundaries.');
+        return;
+      }
       setSpotCoords(latLng);
       // Try to find if there is a matching predefined landmark
       const matchedLandmark = PALANAN_PLACES.find(p => getDistanceMeters(latLng[0], latLng[1], p.latLng[0], p.latLng[1]) <= 25);
@@ -1674,6 +1273,8 @@ export default function MapPage() {
 
     if (activeInputField === 'start' || (!startPoint && activeInputField !== 'end')) {
       setStartPoint(latLng);
+      setIsStartLinkedToGps(false);
+      setGpsStartNotice(null);
       setActiveInputField('end'); // Auto-advance to destination selection
     } else {
       setEndPoint(latLng);
@@ -1681,7 +1282,7 @@ export default function MapPage() {
     }
   };
 
-  // Quick Navigation: tap saved place -> automatically generate safes route from current location
+  // Quick Navigation: tap saved place -> automatically generate safe route from current location
   const selectSavedPlaceCommute = async (place: SavedPlace) => {
     if (!place || !place.location || typeof place.location.lat !== 'number' || typeof place.location.lng !== 'number') {
       console.warn("Cannot commute to place without valid location coordinates.");
@@ -1691,11 +1292,42 @@ export default function MapPage() {
     if (simulationTimer.current) clearInterval(simulationTimer.current);
     setCurrentLoc(null);
     setProximityAlert(null);
+    setGpsStartNotice(null);
 
-    // Set starting point to current location (defaults to PALANAN_CENTER if empty)
-    const startPointCoords = PALANAN_CENTER;
-    setStartPoint(startPointCoords);
-    setEndPoint([place.location.lat, place.location.lng]);
+    const endCoords: [number, number] = [place.location.lat, place.location.lng];
+    setEndPoint(endCoords);
+    setEndQuery(place.name);
+
+    let currentStart = startPoint;
+    if (!currentStart || isStartLinkedToGps) {
+      const res = await getRouteStartFromGps({
+        waitForFix: true,
+        timeoutMs: 10000,
+        onStatus: (msg) => {
+          setRouteWarning(msg);
+          setToastMessage(msg);
+        }
+      });
+      if (res.success) {
+        currentStart = res.point;
+        setStartPoint(res.point);
+        setIsStartLinkedToGps(true);
+        setStartQuery('My location');
+        if (res.notice) {
+          setRouteWarning(res.notice);
+          setToastMessage(res.notice);
+        }
+      } else {
+        setErrorMessage(res.message);
+        setToastMessage(res.message);
+        setGpsStartNotice({
+          message: res.message,
+          canOpenSettings: res.canOpenSettings,
+          offerPickOnMap: res.offerPickOnMap,
+        });
+        return;
+      }
+    }
 
     // Track/Increment usage count in firestore / localStorage to support sorting favorites first
     try {
@@ -1718,10 +1350,9 @@ export default function MapPage() {
       console.error("Failed to increment useCount:", e);
     }
 
-    // Give state a split second to catch up, then run automatic route generation
-    setTimeout(() => {
-      calculateSafeDirections(startPointCoords, [place.location.lat, place.location.lng]);
-    }, 100);
+    if (currentStart) {
+      calculateSafeDirections(currentStart, endCoords);
+    }
   };
 
   // Form submit add/edit places
@@ -1889,21 +1520,71 @@ export default function MapPage() {
     }
   };
 
-  const selectSpotDestination = (spot: CommunitySpot) => {
+  const selectSpotDestination = async (spot: CommunitySpot) => {
     if (!spot || !spot.location) return;
     const coords: [number, number] = [spot.location.lat, spot.location.lng];
     setEndPoint(coords);
     setEndQuery(spot.title);
-    if (!startPoint) {
-      setStartPoint(PALANAN_CENTER);
-    }
     setIsSheetExpanded(true);
-    calculateSafeDirections(startPoint || PALANAN_CENTER, coords);
+    setGpsStartNotice(null);
+
+    let currentStart = startPoint;
+    if (!currentStart || isStartLinkedToGps) {
+      const res = await getRouteStartFromGps({
+        waitForFix: true,
+        timeoutMs: 10000,
+        onStatus: (msg) => {
+          setRouteWarning(msg);
+          setToastMessage(msg);
+        }
+      });
+      if (res.success) {
+        currentStart = res.point;
+        setStartPoint(res.point);
+        setIsStartLinkedToGps(true);
+        setStartQuery('My location');
+        if (res.notice) {
+          setRouteWarning(res.notice);
+          setToastMessage(res.notice);
+        }
+      } else {
+        setErrorMessage(res.message);
+        setToastMessage(res.message);
+        setGpsStartNotice({
+          message: res.message,
+          canOpenSettings: res.canOpenSettings,
+          offerPickOnMap: res.offerPickOnMap,
+        });
+        return;
+      }
+    }
+
+    if (currentStart) {
+      calculateSafeDirections(currentStart, coords);
+    }
   };
 
   const handleCreateCommunitySpot = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!spotTitle.trim() || !spotCoords) return;
+
+    // Validate pinned location coordinates against Palanan boundary
+    if (!isInsidePalanan(spotCoords[0], spotCoords[1])) {
+      setToastMessage('⚠️ Spot location is outside Barangay Palanan. Please select a spot within barangay boundaries.');
+      return;
+    }
+
+    // If user's GPS accuracy is weak (> 50m), ask them to wait for a stronger fix instead of rejecting as outside Palanan
+    if (userAccuracy && userAccuracy > 50) {
+      setToastMessage(`⚠️ GPS accuracy is currently low (±${Math.round(userAccuracy)}m). Please wait a moment for a stronger GPS fix before pinning a spot.`);
+      return;
+    }
+
+    // Validate real-time user GPS position when available
+    if (userLocation && !isInsidePalanan(userLocation[0], userLocation[1])) {
+      setToastMessage('⚠️ You are currently outside Barangay Palanan. Community spots can only be submitted within Palanan.');
+      return;
+    }
 
     if (isDemo) {
       setToastMessage('⚠️ Demo Mode: Adding community spots is disabled to prevent test data creation.');
@@ -1923,6 +1604,7 @@ export default function MapPage() {
         votedUsers: [],
         status: 'pending' as const,
         active: false,
+        approvedByAdmin: false,
         createdAt: Timestamp.now()
       };
 
@@ -1991,22 +1673,14 @@ export default function MapPage() {
     setToastMessage("🛰️ Detecting your live GPS location...");
 
     try {
-      const status = await checkLocationPermission();
-      if (status !== 'granted') {
-        const granted = await requestLocationPermission();
-        if (!granted) {
-          setToastMessage("⚠️ Location permission is required to detect your location.");
-          return;
-        }
+      const granted = await requestGpsPermission();
+      if (!granted) {
+        setToastMessage("⚠️ Location permission is required to detect your location.");
+        return;
       }
 
-      const pos = await getCurrentGpsPosition();
-      const gpsCoords: [number, number] = [pos.latitude, pos.longitude];
-
-      setLiveGpsCoords(gpsCoords);
-      setLiveGpsAccuracy(pos.accuracy);
-      if (typeof pos.heading === 'number' && !isNaN(pos.heading)) setLiveGpsHeading(pos.heading);
-      if (typeof pos.speed === 'number' && !isNaN(pos.speed)) setLiveGpsSpeed(pos.speed);
+      const pos = await getFilteredPosition();
+      const gpsCoords: [number, number] = pos.coords;
 
       if (mapRef.current) {
         mapRef.current.setView(gpsCoords, 17, { animate: true });
@@ -2018,16 +1692,16 @@ export default function MapPage() {
         calculateSafeDirections(gpsCoords, endPoint);
       }
 
-      // Check whether user's real-time GPS coordinate is inside Barangay Palanan
-      const insidePalanan = isInsidePalanan(pos.latitude, pos.longitude);
-      setIsUserOutsidePalanan(!insidePalanan);
-
-      if (!insidePalanan) {
+      if (pos.isOutsidePalanan) {
         setShowOutsidePalananPopup(true);
         setToastMessage("⚠️ You are outside Barangay Palanan.");
       } else {
         setShowOutsidePalananPopup(false);
-        setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
+        if (pos.accuracy > 50) {
+          setToastMessage(`⚠️ GPS Located with weak signal (±${Math.round(pos.accuracy)}m).`);
+        } else {
+          setToastMessage(`📍 GPS Located! Precision: ±${Math.round(pos.accuracy)}m`);
+        }
       }
     } catch (err) {
       console.warn("GPS lookup error:", err);
@@ -2048,12 +1722,110 @@ export default function MapPage() {
     }
   };
 
+  // Reset simulation clock override
+  const resetSimulationClock = () => {
+    setSimClockMode('now');
+    setCustomSimHour(20);
+    currentSimHourRef.current = null;
+  };
+
+  // Recompute route scoring and in-zone heatmap segments when clock override changes or resets
+  const recomputeRoutesWithClock = (isSim: boolean, simHour: number | null) => {
+    const currentRoute = routes[activeRouteIndex];
+    const currentRouteId = currentRoute?.id;
+    const currentRouteName = currentRoute?.name;
+
+    if (rawCandidatesRef.current && rawCandidatesRef.current.length > 0 && startPoint && endPoint) {
+      const result = processRoutePipeline({
+        candidates: rawCandidatesRef.current,
+        start: startPoint,
+        end: endPoint,
+        zones,
+        isSim,
+        simHour
+      });
+      setRoutes(result.routes);
+      setRouteWarning(result.statusMessage || result.warning || null);
+      if (result.routes.length > 0) {
+        const matchIdx = result.routes.findIndex(r => r.id === currentRouteId || r.name === currentRouteName);
+        if (matchIdx >= 0) {
+          setActiveRouteIndex(matchIdx);
+        }
+      }
+    } else {
+      setRoutes(prevRoutes => {
+        if (!prevRoutes || prevRoutes.length === 0) return prevRoutes;
+        if (!startPoint || !endPoint) return prevRoutes;
+        const rawFromPrev: RawRouteCandidate[] = prevRoutes.map(r => ({
+          coordinates: r.coordinates,
+          distance: r.distance,
+          duration: r.duration,
+          steps: r.steps
+        }));
+        const result = processRoutePipeline({
+          candidates: rawFromPrev,
+          start: startPoint,
+          end: endPoint,
+          zones,
+          isSim,
+          simHour
+        });
+        setRouteWarning(result.statusMessage || result.warning || null);
+        return result.routes;
+      });
+    }
+  };
+
+  // Handler for changing simulated clock mid-simulation
+  const handleClockModeChange = (mode: 'now' | '10pm' | '2pm' | 'custom', customVal?: number) => {
+    setSimClockMode(mode);
+    const targetCustom = customVal !== undefined ? customVal : customSimHour;
+    if (customVal !== undefined) setCustomSimHour(customVal);
+
+    const newSimHour: number | null = mode === '10pm' ? 22 : mode === '2pm' ? 14 : mode === 'custom' ? targetCustom : null;
+    currentSimHourRef.current = newSimHour;
+
+    // Immediately re-scan radar proximity for currentLoc if active
+    if (currentLoc) {
+      let activeDangerMsg: string | null = null;
+      zones.forEach(zone => {
+        if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+        if (!isZoneCurrentlyActive(zone, true, newSimHour)) return;
+        const d = getDistanceMeters(currentLoc[0], currentLoc[1], zone.location.lat, zone.location.lng);
+        if (d <= zone.radius) {
+          activeDangerMsg = `PROXIMITY WARNING: Inside active ${ZONE_LABEL.toLowerCase()}: "${zone.description}".`;
+        } else if (d <= zone.radius * 1.5 && !activeDangerMsg) {
+          activeDangerMsg = `AWARENESS: Nearing active ${ZONE_LABEL.toLowerCase()}: "${zone.description}" within ${Math.round(d)}m.`;
+        }
+      });
+      setProximityAlert(activeDangerMsg);
+      if (activeDangerMsg) playAlertBuzzer();
+    }
+
+    // Immediately recompute route safety & segments with the new simulated clock
+    recomputeRoutesWithClock(true, newSimHour);
+  };
+
   // Simulating active GPS path
-  const startSimulation = () => {
-    if (!routes[activeRouteIndex]) return;
+  const startSimulation = (targetIndex?: number | any) => {
+    const numericIndex = typeof targetIndex === 'number' ? targetIndex : activeRouteIndex;
+    const targetRoute = routes[numericIndex] || routes[activeRouteIndex] || routes[0];
+    if (!targetRoute) {
+      if (startPoint && endPoint) {
+        calculateSafeDirections(startPoint, endPoint).then(() => {
+          setIsSimulating(true);
+        });
+        return;
+      }
+      setErrorMessage("Please set both a Start Location and Destination to simulate walking.");
+      return;
+    }
+    const resolvedIndex = routes.indexOf(targetRoute) >= 0 ? routes.indexOf(targetRoute) : numericIndex;
+    setActiveRouteIndex(resolvedIndex);
     setIsSimulating(true);
     setSimulatedIndex(0);
-    const coords = routes[activeRouteIndex].coordinates;
+    const coords = targetRoute.coordinates;
+    if (!coords || coords.length === 0) return;
     setCurrentLoc(coords[0]);
     setProximityAlert(null);
 
@@ -2067,21 +1839,26 @@ export default function MapPage() {
           setIsSimulating(false);
           playAlertBuzzer();
           setCurrentLoc(coords[coords.length - 1]);
+          if (simClockMode !== 'now') {
+            resetSimulationClock();
+            recomputeRoutesWithClock(false, null);
+          }
           return coords.length - 1;
         }
 
         const point = coords[nextIdx];
         setCurrentLoc(point);
 
-        // Scan radar alert proximity limits
+        // Scan radar alert proximity limits using active simulated clock override
         let activeDangerMsg: string | null = null;
         zones.forEach(zone => {
           if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+          if (!isZoneCurrentlyActive(zone, true, currentSimHourRef.current)) return; // Strictly feeds simulated clock!
           const d = getDistanceMeters(point[0], point[1], zone.location.lat, zone.location.lng);
           if (d <= zone.radius) {
-            activeDangerMsg = `PROXIMITY WARNING: Inside active threat zone: "${zone.description}".`;
+            activeDangerMsg = `PROXIMITY WARNING: Inside active ${ZONE_LABEL.toLowerCase()}: "${zone.description}".`;
           } else if (d <= zone.radius * 1.5 && !activeDangerMsg) {
-            activeDangerMsg = `AWARENESS: Nearing crime hotspot: "${zone.description}" within ${Math.round(d)}m.`;
+            activeDangerMsg = `AWARENESS: Nearing active ${ZONE_LABEL.toLowerCase()}: "${zone.description}" within ${Math.round(d)}m.`;
           }
         });
 
@@ -2097,12 +1874,37 @@ export default function MapPage() {
     }, 800);
   };
 
+  // Switch selected route and keep simulator running if active
+  const selectRoute = (idx: number) => {
+    setActiveRouteIndex(idx);
+    if (isSimulating) {
+      startSimulation(idx);
+    }
+  };
+
   const stopSimulation = () => {
     setIsSimulating(false);
     if (simulationTimer.current) clearInterval(simulationTimer.current);
     setCurrentLoc(null);
     setProximityAlert(null);
+    if (simClockMode !== 'now') {
+      resetSimulationClock();
+      recomputeRoutesWithClock(false, null);
+    }
   };
+
+  // Ensure override resets on page unmount and app close (beforeunload)
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      resetSimulationClock();
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => {
+      if (simulationTimer.current) clearInterval(simulationTimer.current);
+      resetSimulationClock();
+      window.removeEventListener('beforeunload', handleBeforeUnload);
+    };
+  }, []);
 
   const triggerDetour = () => {
     if (!currentLoc) return;
@@ -2135,15 +1937,92 @@ export default function MapPage() {
     setIsSheetExpanded(false);
   };
 
-  const handleClearStartPoint = () => {
-    setStartPoint(null);
-    setStartQuery('');
+  const handleClearStartPoint = async () => {
     setRouteCalculated(false);
     setRoutes([]);
     setIsSimulating(false);
     if (simulationTimer.current) clearInterval(simulationTimer.current);
     setCurrentLoc(null);
     setProximityAlert(null);
+    setGpsStartNotice(null);
+
+    // Clearing the field returns to "My location"
+    const res = await getRouteStartFromGps({ waitForFix: false });
+    if (res.success) {
+      setStartPoint(res.point);
+      setIsStartLinkedToGps(true);
+      setStartQuery('My location');
+    } else {
+      setStartPoint(null);
+      setStartQuery('');
+      setIsStartLinkedToGps(false);
+      setGpsStartNotice({
+        message: res.message,
+        canOpenSettings: res.canOpenSettings,
+        offerPickOnMap: res.offerPickOnMap,
+      });
+    }
+  };
+
+  const handleUseGpsForStart = async () => {
+    setGpsStartNotice(null);
+    const res = await getRouteStartFromGps({
+      waitForFix: true,
+      timeoutMs: 10000,
+      onStatus: (msg) => {
+        setRouteWarning(msg);
+        setToastMessage(msg);
+      }
+    });
+
+    if (res.success) {
+      setStartPoint(res.point);
+      setIsStartLinkedToGps(true);
+      setStartQuery('My location');
+      setErrorMessage(null);
+      setGpsStartNotice(null);
+      if (res.notice) {
+        setToastMessage(res.notice);
+        setRouteWarning(res.notice);
+      }
+    } else {
+      setErrorMessage(res.message);
+      setToastMessage(res.message);
+      setGpsStartNotice({
+        message: res.message,
+        canOpenSettings: res.canOpenSettings,
+        offerPickOnMap: res.offerPickOnMap,
+      });
+    }
+  };
+
+  const handleRecalculateFromHere = async () => {
+    setIsOffRoute(false);
+    const res = await getRouteStartFromGps({
+      waitForFix: true,
+      timeoutMs: 10000,
+      onStatus: (msg) => {
+        setRouteWarning(msg);
+        setToastMessage(msg);
+      }
+    });
+    if (res.success && endPoint) {
+      setStartPoint(res.point);
+      setIsStartLinkedToGps(true);
+      setStartQuery('My location');
+      if (res.notice) {
+        setRouteWarning(res.notice);
+        setToastMessage(res.notice);
+      }
+      calculateSafeDirections(res.point, endPoint);
+    } else if (!res.success) {
+      setToastMessage(res.message);
+      setGpsStartNotice({
+        message: res.message,
+        canOpenSettings: res.canOpenSettings,
+        offerPickOnMap: res.offerPickOnMap,
+      });
+    }
   };
 
   const handleClearEndPoint = () => {
@@ -2162,6 +2041,28 @@ export default function MapPage() {
   const activeDistanceString = activeRoute ? `${(activeRoute.distance / 1000).toFixed(1)} km` : "1.3 km";
   const activeTimeString = activeRoute ? `${Math.max(1, Math.ceil(activeRoute.duration / 60))} minutes` : "15 minutes";
   const activeScore = activeRoute ? activeRoute.safetyScore : 92;
+
+  const [showRouteDebug, setShowRouteDebug] = useState<boolean>(true);
+  const showHeatmapSelfTest = typeof window !== 'undefined' && (
+    new URLSearchParams(window.location.search).has('testHeatmap') ||
+    (window as any).__SAFE_ROUTE_TEST_HEATMAP === true
+  );
+
+  // Active zones right now (accounting for simulation clock if active)
+  const activeNowZones = React.useMemo(() => {
+    return (zones || []).filter(z => {
+      if (!z || isZoneResolved(z) || z.active === false) return false;
+      if (!z.location || typeof z.location.lat !== 'number' || typeof z.location.lng !== 'number') return false;
+      return isZoneCurrentlyActive(z, isSimulating, currentSimHourRef.current);
+    });
+  }, [zones, isSimulating, simulatedHour]);
+
+  // Compute in-zone segments at render time directly from displayed route coordinates (densified to 10m)
+  // and active zones, merging consecutive in-zone points into a single polyline per zone entry.
+  const activeInZoneSegments: InZonePolylineSegment[] = React.useMemo(() => {
+    if (!activeRoute || !activeRoute.coordinates || activeRoute.coordinates.length < 2) return [];
+    return computeInZonePolylinesAtRenderTime(activeRoute.coordinates, activeNowZones);
+  }, [activeRoute, activeNowZones]);
 
   // Filter recommendations matching address
   const startPlacesFiltered = PALANAN_PLACES.filter(p => p.name.toLowerCase().includes(startQuery.toLowerCase()));
@@ -2186,6 +2087,7 @@ export default function MapPage() {
               : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"}
           />
           <MapEventsHandler onMapClick={handleMapSelection} onMapLongPress={setLongPressCoords} />
+          <MapPanesSetup />
           
           {/* Custom Saved Places markers visible on map */}
           {savedPlaces.filter(pl => pl && pl.location && typeof pl.location.lat === 'number' && typeof pl.location.lng === 'number').map((pl) => (
@@ -2252,7 +2154,7 @@ export default function MapPage() {
 
           <EnforceBoundsAndSettings />
           <MapViewController 
-            liveCoords={liveGpsCoords} 
+            liveCoords={userLocation} 
             autoFollow={autoFollowGps} 
             onMapInstance={(m) => { mapRef.current = m; }} 
             onUserDrag={() => setAutoFollowGps(false)} 
@@ -2276,6 +2178,7 @@ export default function MapPage() {
                 <Circle 
                   center={[zone.location.lat, zone.location.lng]} 
                   radius={zone.radius * 1.5} 
+                  pane="dangerZonesPane"
                   pathOptions={{ 
                     fillColor: specs.color, 
                     fillOpacity: specs.fillOpacityGlow, 
@@ -2287,6 +2190,7 @@ export default function MapPage() {
                 <Circle 
                   center={[zone.location.lat, zone.location.lng]} 
                   radius={zone.radius} 
+                  pane="dangerZonesPane"
                   pathOptions={{ 
                     fillColor: specs.color, 
                     fillOpacity: specs.fillOpacityPrecision, 
@@ -2296,12 +2200,88 @@ export default function MapPage() {
                   }} 
                 >
                   <Popup>
-                    <div id={`danger-zone-popup-${zone.id}`} className="text-xs p-1">
-                      <span className={`font-bold uppercase tracking-wide block ${specs.labelClass}`}>
-                        {specs.label}
-                      </span>
-                      <p className="mt-1 font-semibold text-slate-850">{zone.description}</p>
-                      <p className="text-[9px] text-slate-400 mt-0.5">Active monitoring within {zone.radius}m</p>
+                    <div id={`danger-zone-popup-${zone.id}`} className="text-xs p-1.5 min-w-[210px] max-w-[270px]">
+                      {/* Top Header Badge */}
+                      <div className="flex items-center justify-between gap-1.5 mb-1.5">
+                        <span className={`text-[10px] px-2 py-0.5 rounded-md font-bold uppercase tracking-wider ${specs.labelClass} bg-orange-50 border border-orange-200`}>
+                          {specs.label}
+                        </span>
+                      </div>
+
+                      {/* Name / Location Name */}
+                      {zone.name && (
+                        <h4 className="font-bold text-slate-900 text-sm mb-0.5">
+                          {escapeHtml(zone.name)}
+                        </h4>
+                      )}
+
+                      {/* Category - plain text */}
+                      {zone.category && (
+                        <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
+                          Category: {escapeHtml(zone.category)}
+                        </div>
+                      )}
+
+                      {/* Status stated in words */}
+                      <div className="text-xs text-slate-700 font-medium mb-1.5 flex items-center gap-1.5">
+                        <span className="text-slate-400 text-[11px]">Status:</span>
+                        <span className="font-bold text-slate-900">{specs.statusText}</span>
+                      </div>
+
+                      {/* Description */}
+                      <p className="text-xs text-slate-700 leading-snug mb-2 font-medium">
+                        {escapeHtml(zone.description)}
+                      </p>
+
+                      {/* Inactive notice if not currently active */}
+                      {!specs.isNow && (
+                        <div className="bg-slate-50 text-slate-700 text-[10px] font-semibold px-2 py-1 rounded-md border border-slate-200 mb-2">
+                          🌙 {formatActiveTimeWindow(zone)} — Currently inactive
+                        </div>
+                      )}
+
+                      {/* Data Contract Info Block */}
+                      <div className="space-y-1 pt-1.5 border-t border-slate-100 text-[11px]">
+                        {/* Source */}
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-slate-400 text-[10px]">Source:</span>
+                          <span className="font-semibold text-slate-700 text-right">
+                            {escapeHtml(getSourceLabel(zone.source))}
+                          </span>
+                        </div>
+
+                        {/* Incident Count */}
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-slate-400 text-[10px]">Incidents:</span>
+                          <span className="font-semibold text-slate-700 text-right">
+                            {escapeHtml(formatIncidentCountText(zone))}
+                          </span>
+                        </div>
+
+                        {/* Active Time Window */}
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-slate-400 text-[10px]">Active Window:</span>
+                          <span className="font-semibold text-slate-700 text-right">
+                            {escapeHtml(formatActiveTimeWindow(zone))}
+                          </span>
+                        </div>
+
+                        {/* Crime Types Breakdown */}
+                        {zone.crimeTypes && Object.keys(zone.crimeTypes).length > 0 && (
+                          <div className="pt-1 mt-1 border-t border-slate-100">
+                            <span className="text-slate-400 text-[10px] block mb-1">Incident Types:</span>
+                            <div className="flex flex-wrap gap-1">
+                              {Object.entries(zone.crimeTypes).map(([type, c]) => (
+                                <span key={type} className="inline-block bg-slate-100 text-slate-700 px-1.5 py-0.5 rounded text-[10px] font-medium">
+                                  {escapeHtml(type)}: {escapeHtml(String(c))}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      <p className="text-[9px] text-slate-400 mt-2">Monitoring perimeter: {zone.radius}m</p>
                     </div>
                   </Popup>
                 </Circle>
@@ -2309,9 +2289,9 @@ export default function MapPage() {
             );
           })}
 
-          {/* Community Spots Pinpoint Markers */}
+          {/* Community Spots Pinpoint Markers (Approved) */}
           {showCommunitySpots && communitySpots
-            .filter(spot => spot && spot.active && spot.status === 'approved' && spot.location && typeof spot.location.lat === 'number' && typeof spot.location.lng === 'number')
+            .filter(isSpotVisibleOnMap)
             .filter(spot => selectedSpotCategory === 'all' || spot.category === selectedSpotCategory)
             .map((spot) => {
               const isSelected = selectedCommunitySpot?.id === spot.id;
@@ -2319,7 +2299,7 @@ export default function MapPage() {
                 <Marker
                   key={`spot-${spot.id}`}
                   position={[spot.location.lat, spot.location.lng]}
-                  icon={createCommunitySpotIcon(spot.category, isSelected)}
+                  icon={createCommunitySpotIcon(spot.category, isSelected, false)}
                   eventHandlers={{
                     click: () => setSelectedCommunitySpot(spot)
                   }}
@@ -2372,6 +2352,49 @@ export default function MapPage() {
               );
             })}
 
+          {/* Community Spots Author-Only Pending Preview (Dashed border, 'Under review' badge) */}
+          {showCommunitySpots && communitySpots
+            .filter(spot => isSpotAuthorPending(spot, user?.uid))
+            .filter(spot => selectedSpotCategory === 'all' || spot.category === selectedSpotCategory)
+            .map((spot) => {
+              const isSelected = selectedCommunitySpot?.id === spot.id;
+              return (
+                <Marker
+                  key={`pending-spot-${spot.id}`}
+                  position={[spot.location.lat, spot.location.lng]}
+                  icon={createCommunitySpotIcon(spot.category, isSelected, true)}
+                  eventHandlers={{
+                    click: () => setSelectedCommunitySpot(spot)
+                  }}
+                >
+                  <Popup>
+                    <div className="p-2 min-w-[210px] max-w-[260px] text-xs font-sans">
+                      <div className="flex items-center justify-between gap-2 mb-1.5">
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider text-amber-900 bg-amber-100 border border-amber-300">
+                          {getSpotCategoryIcon(spot.category)} {getSpotCategoryLabel(spot.category)}
+                        </span>
+                        <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold text-amber-800 bg-amber-50 border border-dashed border-amber-300">
+                          ⏳ Under review
+                        </span>
+                      </div>
+                      
+                      <h4 className="font-black text-slate-900 text-sm leading-snug mb-1">{spot.title}</h4>
+                      <p className="text-slate-600 text-xs mb-2 leading-relaxed">{spot.description}</p>
+                      
+                      <div className="p-1.5 mb-2 rounded bg-amber-50 border border-amber-200 text-[10px] text-amber-900 leading-tight">
+                        📢 <strong>Author Preview:</strong> Only you can see this spot on your map while awaiting Barangay Palanan approval.
+                      </div>
+
+                      <div className="flex items-center justify-between text-[10px] text-slate-400 pt-1 border-t border-slate-100">
+                        <span>Submitted by You</span>
+                        <span className="font-semibold text-amber-600">Pending Review</span>
+                      </div>
+                    </div>
+                  </Popup>
+                </Marker>
+              );
+            })}
+
           {/* Start Point Pin */}
           {startPoint && !currentLoc && (
             <>
@@ -2392,131 +2415,72 @@ export default function MapPage() {
             </>
           )}
 
-          {/* Real-Time Live User GPS Pinpoint & Precision Halo */}
-          {liveGpsCoords && !isSimulating && (
+          {/* Exactly ONE User Location Marker (Google Maps style) */}
+          {userLocation && (
+            <UserLocationMarker
+              position={userLocation}
+              accuracy={userAccuracy}
+              heading={userHeading}
+              speed={userSpeed}
+              status={gpsStatus}
+              isStale={isGpsStale}
+              isOutsidePalanan={isUserOutsidePalanan}
+              isSimulating={isSimulating}
+              autoFollow={autoFollowGps}
+              onToggleAutoFollow={() => setAutoFollowGps(!autoFollowGps)}
+            />
+          )}
+
+          {/* Drawn routing paths on streets */}
+          {routeCalculated && startPoint && endPoint && (
             <>
-              <Marker position={liveGpsCoords} icon={createLiveGpsPuckIcon(liveGpsHeading, isUserOutsidePalanan)}>
-                <Popup>
-                  <div className="text-xs p-1 min-w-[170px]">
-                    {isUserOutsidePalanan ? (
-                      <div className="p-2 -m-1 mb-2 rounded-xl bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-900/50 text-red-700 dark:text-red-300">
-                        <span className="font-black text-xs flex items-center gap-1.5 text-red-600 dark:text-red-400">
-                          <AlertCircle className="w-4 h-4 text-red-500 shrink-0" />
-                          Outside Barangay Palanan
-                        </span>
-                        <p className="text-[10px] text-slate-600 dark:text-slate-300 mt-1 font-medium leading-snug">
-                          Your live GPS position is outside Barangay Palanan.
-                        </p>
-                      </div>
-                    ) : (
-                      <span className="font-bold text-blue-600 flex items-center gap-1.5">
-                        <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping inline-block"></span>
-                        Real-Time GPS Location
-                      </span>
-                    )}
-                    <p className="text-[10px] text-slate-600 mt-1 font-medium">
-                      {liveGpsAccuracy ? `Precision: ±${Math.round(liveGpsAccuracy)} meters` : 'High-precision GPS'}
-                    </p>
-                    {liveGpsSpeed !== null && liveGpsSpeed > 0.3 && (
-                      <p className="text-[10px] text-emerald-600 font-semibold mt-0.5">
-                        Moving: {(liveGpsSpeed * 3.6).toFixed(1)} km/h
-                      </p>
-                    )}
-                    <button
-                      onClick={() => setAutoFollowGps(!autoFollowGps)}
-                      className={`mt-2 w-full py-1 px-2 rounded text-[10px] font-bold cursor-pointer ${
-                        autoFollowGps ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-700'
-                      }`}
-                    >
-                      {autoFollowGps ? '✓ Auto-Follow On' : 'Enable Auto-Follow'}
-                    </button>
-                  </div>
-                </Popup>
-              </Marker>
-              {liveGpsAccuracy && liveGpsAccuracy > 0 && (
-                <Circle 
-                  center={liveGpsCoords} 
-                  radius={Math.min(Math.max(liveGpsAccuracy, 6), 60)} 
-                  pathOptions={{ 
-                    fillColor: '#3b82f6', 
-                    fillOpacity: 0.12, 
-                    color: '#2563eb', 
-                    weight: 1.5,
-                    dashArray: '2, 3'
-                  }} 
-                />
-              )}
-            </>
-          )}
+              {/* 1. Unselected routes rendered first (subtle dashed line, no wide light-blue halo) */}
+              {routes.map((r, idx) => {
+                if (idx === activeRouteIndex) return null;
+                return (
+                  <Polyline 
+                    key={`polyline-unselected-${idx}`}
+                    positions={r.coordinates}
+                    pane="routeUnderlayPane"
+                    eventHandlers={{ 
+                      click: () => selectRoute(idx)
+                    }}
+                    pathOptions={{
+                      color: '#94a3b8',
+                      weight: 3.5,
+                      dashArray: '6, 8',
+                      opacity: 0.55,
+                      lineCap: 'round',
+                      lineJoin: 'round'
+                    }}
+                  />
+                );
+              })}
 
-          {/* Active Navigation simulated GPS tracker */}
-          {currentLoc && (
-            <Marker position={currentLoc} icon={userIcon}>
-              <Popup>
-                <div className="text-xs p-0.5">
-                  <span className="font-bold text-emerald-600 block">Live Safe Tracker</span>
-                  <span className="text-[10px] text-slate-500">Real-Time telemetry</span>
-                </div>
-              </Popup>
-            </Marker>
-          )}
-
-          {/* Drawn routing path on streets */}
-          {routeCalculated && startPoint && endPoint && routes.map((r, idx) => {
-            const isSelected = idx === activeRouteIndex;
-            const borderWeight = isSelected ? 10 : 5;
-            const innerWeight = isSelected ? 5 : 2;
-            const borderCol = isSelected ? '#0f172a' : '#cbd5e1';
-
-            return (
-              <React.Fragment key={`polyline-${idx}`}>
-                {/* Contrast backup halo line */}
-                <Polyline 
-                  positions={r.coordinates}
-                  eventHandlers={{ click: () => { if (!isSimulating) setActiveRouteIndex(idx); } }}
-                  pathOptions={{
-                    color: borderCol,
-                    weight: borderWeight,
-                    opacity: isSelected ? 0.9 : 0.3,
-                    lineCap: 'round',
-                    lineJoin: 'round'
-                  }}
-                />
-                
-                {/* Primary core color road line - segmented if selected, single-colored if unselected */}
-                {isSelected && r.segments && r.segments.length > 0 ? (
-                  r.segments.map((seg, sIdx) => (
+              {/* 2. Selected route rendered on top with vibrant contrast */}
+              {routes[activeRouteIndex] && (() => {
+                const r = routes[activeRouteIndex];
+                const idx = activeRouteIndex;
+                return (
+                  <React.Fragment key={`polyline-active-${idx}-${r.id}`}>
+                    {/* 1. Underlying clean green route along full coordinates */}
                     <Polyline 
-                      key={`polyline-seg-${idx}-${sIdx}`}
-                      positions={seg.coordinates}
-                      eventHandlers={{ click: () => { if (!isSimulating) setActiveRouteIndex(idx); } }}
+                      positions={r.coordinates}
+                      pane="routeUnderlayPane"
                       pathOptions={{
-                        color: seg.color,
-                        weight: innerWeight,
+                        pane: 'routeUnderlayPane',
+                        color: '#10B981',
+                        weight: 5,
                         opacity: 1.0,
                         lineCap: 'round',
                         lineJoin: 'round'
                       }}
                     />
-                  ))
-                ) : (
-                  <Polyline 
-                    positions={r.coordinates}
-                    eventHandlers={{ click: () => { if (!isSimulating) setActiveRouteIndex(idx); } }}
-                    pathOptions={{
-                      color: isSelected 
-                        ? (r.safety === 'danger' ? '#F97316' : r.safety === 'moderate' ? '#F59E0B' : '#10B981')
-                        : '#94a3b8',
-                      weight: innerWeight,
-                      opacity: isSelected ? 1.0 : 0.4,
-                      lineCap: 'round',
-                      lineJoin: 'round'
-                    }}
-                  />
-                )}
-              </React.Fragment>
-            );
-          })}
+                  </React.Fragment>
+                );
+              })()}
+            </>
+          )}
 
           {/* Temporary Pinpoint Preview Marker when picking spot location on map */}
           {spotCoords && (isAddSpotModalOpen || isPickingSpotOnMap) && (
@@ -2528,6 +2492,48 @@ export default function MapPage() {
                 </div>
               </Popup>
             </Marker>
+          )}
+
+          {/* LAST CHILDREN OF THE MAP: Heatmap in-zone segments rendered strictly on top with higher zIndex (620) */}
+          {routeCalculated && activeRoute && (
+            <React.Fragment key={`heatmap-layer-${activeRouteIndex}-${activeRoute.id}`}>
+              {activeInZoneSegments.map((seg, sIdx) => {
+                return (
+                  <Polyline 
+                    key={`seg-inzone-heatmap-${activeRouteIndex}-${activeRoute.id}-${sIdx}-${seg.coordinates.length}`}
+                    positions={seg.coordinates}
+                    pane="inZoneHeatmapPane"
+                    pathOptions={{
+                      pane: 'inZoneHeatmapPane',
+                      color: ZONE_COLOR,
+                      weight: 8,
+                      opacity: 1.0,
+                      lineCap: 'round',
+                      lineJoin: 'round',
+                      interactive: false
+                    }}
+                  />
+                );
+              })}
+            </React.Fragment>
+          )}
+
+          {/* Hidden self-test polyline (behind flag) that draws fixed orange polyline in inZoneHeatmapPane */}
+          {showHeatmapSelfTest && (
+            <Polyline 
+              key="heatmap-selftest-fixed-dian"
+              positions={[[14.55700, 120.99920], [14.55780, 120.99920]]}
+              pane="inZoneHeatmapPane"
+              pathOptions={{
+                pane: 'inZoneHeatmapPane',
+                color: ZONE_COLOR,
+                weight: 8,
+                opacity: 1.0,
+                lineCap: 'round',
+                lineJoin: 'round',
+                interactive: false
+              }}
+            />
           )}
 
         </MapContainer>
@@ -2552,96 +2558,141 @@ export default function MapPage() {
 
 
 
-        {/* Community Spots Pinpoint Control Bar & Legend */}
-        <div id="community-spots-map-control" className={`absolute top-4 left-4 z-[990] rounded-2xl shadow-xl border p-2.5 max-w-xs transition-colors duration-300 ${
-          darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white/95 backdrop-blur border-slate-200 text-slate-800'
-        }`}>
-          <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100 mb-2">
-            <button
-              type="button"
-              onClick={() => setShowCommunitySpots(!showCommunitySpots)}
-              className="flex items-center gap-1.5 text-xs font-black tracking-wide text-slate-800 hover:text-emerald-600 transition"
-            >
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-              <span>🌟 COMMUNITY SPOTS</span>
-              <span className="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded-full font-bold">
-                {activeApprovedSpots.length}
-              </span>
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                setIsAddSpotModalOpen(false);
-                setIsPickingSpotOnMap(true);
-              }}
-              className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[10px] font-bold py-1 px-2.5 rounded-full flex items-center gap-1 shadow-xs transition-all cursor-pointer"
-            >
-              <Plus className="w-3 h-3" /> Pin Spot
-            </button>
+        {/* Top Controls: Community Spots and GPS Status Chip side-by-side */}
+        <div className="absolute top-4 left-4 z-[990] flex items-start gap-2.5 max-w-[calc(100vw-32px)] pointer-events-none">
+          {/* Community Spots Pinpoint Control Bar & Legend */}
+          <div id="community-spots-map-control" className={`rounded-2xl shadow-xl border p-2.5 max-w-xs transition-colors duration-300 pointer-events-auto shrink-0 ${
+            darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white/95 backdrop-blur border-slate-200 text-slate-800'
+          }`}>
+            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100 mb-2">
+              <button
+                type="button"
+                onClick={() => setShowCommunitySpots(!showCommunitySpots)}
+                className="flex items-center gap-1.5 text-xs font-black tracking-wide text-slate-800 hover:text-emerald-600 transition"
+              >
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                <span>🌟 COMMUNITY SPOTS</span>
+                <span className="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+                  {activeApprovedSpots.length}
+                </span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (userAccuracy && userAccuracy > 50) {
+                    setToastMessage(`⚠️ GPS accuracy is currently low (±${Math.round(userAccuracy)}m). Please wait a moment for a stronger GPS fix before pinning a spot.`);
+                    return;
+                  }
+                  if (userLocation && !isInsidePalanan(userLocation[0], userLocation[1])) {
+                    setToastMessage('⚠️ You are currently outside Barangay Palanan. Community spots can only be submitted within Palanan.');
+                    return;
+                  }
+                  setIsAddSpotModalOpen(false);
+                  setIsPickingSpotOnMap(true);
+                }}
+                className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[10px] font-bold py-1 px-2.5 rounded-full flex items-center gap-1 shadow-xs transition-all cursor-pointer"
+              >
+                <Plus className="w-3 h-3" /> Pin Spot
+              </button>
+            </div>
+
+            {showCommunitySpots && (
+              <div className="flex flex-wrap gap-1">
+                {[
+                  { id: 'all', label: 'All', icon: '📍' },
+                  { id: 'safe_haven', label: 'Safe Haven', icon: '🛡️' },
+                  { id: 'well_lit', label: 'Well-Lit', icon: '💡' },
+                  { id: 'friendly_business', label: 'Store', icon: '🏪' },
+                  { id: 'community_hub', label: 'Hub', icon: '☕' },
+                  { id: 'enjoyed_spot', label: 'Enjoyed', icon: '🌟' }
+                ].map((cat) => (
+                  <button
+                    key={cat.id}
+                    type="button"
+                    onClick={() => setSelectedSpotCategory(cat.id)}
+                    className={`px-2 py-0.5 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all ${
+                      selectedSpotCategory === cat.id
+                        ? 'bg-slate-900 text-white shadow-xs scale-105'
+                        : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                    }`}
+                  >
+                    <span>{cat.icon}</span>
+                    <span>{cat.label}</span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
 
-          {showCommunitySpots && (
-            <div className="flex flex-wrap gap-1">
-              {[
-                { id: 'all', label: 'All', icon: '📍' },
-                { id: 'safe_haven', label: 'Safe Haven', icon: '🛡️' },
-                { id: 'well_lit', label: 'Well-Lit', icon: '💡' },
-                { id: 'friendly_business', label: 'Store', icon: '🏪' },
-                { id: 'community_hub', label: 'Hub', icon: '☕' },
-                { id: 'enjoyed_spot', label: 'Enjoyed', icon: '🌟' }
-              ].map((cat) => (
-                <button
-                  key={cat.id}
-                  type="button"
-                  onClick={() => setSelectedSpotCategory(cat.id)}
-                  className={`px-2 py-0.5 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all ${
-                    selectedSpotCategory === cat.id
-                      ? 'bg-slate-900 text-white shadow-xs scale-105'
-                      : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
-                  }`}
-                >
-                  <span>{cat.icon}</span>
-                  <span>{cat.label}</span>
-                </button>
-              ))}
-            </div>
-          )}
+          {/* Real-Time GPS Status Chip & Recenter Badge placed beside Community Spots */}
+          <div className="shrink-0 pointer-events-auto">
+            <GpsStatusChip
+              status={gpsStatus}
+              isStale={isGpsStale}
+              accuracy={userAccuracy}
+              autoFollow={autoFollowGps}
+              onRecenter={() => recenterGps(mapRef.current)}
+              onRequestPermission={requestGpsPermission}
+              onOpenSettings={openGpsSettings}
+            />
+          </div>
         </div>
+
+        {/* Off-Route Alert Notice with 10s persistence threshold */}
+        {isOffRoute && userLocation && endPoint && (
+          <div className="absolute top-16 left-4 right-4 z-[1050] bg-amber-500 text-white p-3 rounded-2xl shadow-xl flex items-center justify-between gap-3 animate-fade-in border border-amber-400">
+            <div className="flex items-center gap-2 text-xs font-bold text-left">
+              <AlertCircle className="w-5 h-5 shrink-0 text-white" />
+              <div>
+                <p className="font-extrabold leading-tight">You are off the selected route</p>
+                <p className="text-[10px] font-medium opacity-90">{offRouteDistance}m from planned route</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleRecalculateFromHere}
+              className="px-3 py-1.5 rounded-xl bg-white text-amber-700 text-xs font-black shadow-sm hover:bg-amber-50 active:scale-95 transition shrink-0 cursor-pointer"
+            >
+              Recalculate from here
+            </button>
+          </div>
+        )}
 
         {/* Floating current location + Map controls directly on bottom-right of map */}
         <FloatingMapControls 
-          onRecenter={() => {
-            setAutoFollowGps(true);
-            handleLocateAndCenter();
-          }}
+          onRecenter={() => recenterGps(mapRef.current)}
           onZoomIn={handleZoomIn}
           onZoomOut={handleZoomOut}
           autoFollow={autoFollowGps}
-          hasLiveGps={!!liveGpsCoords}
+          hasLiveGps={!!userLocation}
           isOutsidePalanan={isUserOutsidePalanan}
         />
 
         {/* Circles Risk Legend to sync with Admin Portal */}
-        <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-36 text-left transition-colors duration-300 ${
+        <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-40 text-left transition-colors duration-300 ${
           darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-800'
         }`}>
           <h4 className={`text-[10px] font-black tracking-wider uppercase mb-1.5 pb-1 border-b ${
             darkMode ? 'text-slate-300 border-slate-800' : 'text-slate-800 border-slate-150'
           }`}>
-            CIRCLES LEGEND
+            MAP LEGEND
           </h4>
-          <div className="space-y-1.5">
+          <div className="space-y-2">
             <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#10B981' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Low Risk</span>
+              <span className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: ZONE_COLOR }} />
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Caution Area</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#F59E0B' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>Moderate</span>
+              <span className="w-3.5 h-3.5 rounded-full shrink-0 border-2 border-dashed" style={{ borderColor: ZONE_COLOR, backgroundColor: 'transparent' }} />
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Inactive right now</span>
             </div>
             <div className="flex items-center gap-2">
-              <span className="w-3 h-3 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: '#F97316' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-600'}`}>High Risk</span>
+              <span className="w-3.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: '#10B981' }} />
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Clear</span>
+            </div>
+            <div className="flex items-center gap-2 pt-0.5 border-t border-slate-100">
+              <span className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border-2 border-white" style={{ backgroundColor: '#4285F4' }} />
+              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Your Location</span>
             </div>
           </div>
         </div>
@@ -2685,9 +2736,70 @@ export default function MapPage() {
           )}
         </AnimatePresence>
 
+        {/* Floating Simulated Time Override Badge (visible while isSimulating && simulatedHour !== null) */}
+        <AnimatePresence>
+          {isSimulating && simulatedHour !== null && (
+            <motion.div
+              initial={{ y: -30, opacity: 0 }}
+              animate={{ y: 0, opacity: 1 }}
+              exit={{ y: -30, opacity: 0 }}
+              className="absolute top-16 right-4 z-[1015]"
+            >
+              <div id="simulated-time-badge" className="bg-amber-500 text-slate-950 font-black text-xs px-3.5 py-1.5 rounded-full shadow-xl border-2 border-white flex items-center gap-1.5 animate-pulse">
+                <Clock className="w-3.5 h-3.5" />
+                <span>Simulated time: {String(Math.floor(simulatedHour)).padStart(2, '0')}:{String(Math.round((simulatedHour % 1) * 60)).padStart(2, '0')}</span>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
+        {/* Real-time Caution Area Warning Popup */}
+        <AnimatePresence>
+          {activeZoneAlert && dismissedZoneId !== activeZoneAlert.zoneId && (
+            <motion.div 
+              initial={{ y: -60, opacity: 0, scale: 0.95 }} 
+              animate={{ y: 0, opacity: 1, scale: 1 }} 
+              exit={{ y: -60, opacity: 0, scale: 0.95 }} 
+              className="absolute top-4 left-4 right-4 z-[1010]"
+            >
+              <div className="bg-[#EA580C] text-white p-3.5 rounded-2xl shadow-2xl flex items-start justify-between gap-3 border-2 border-orange-300">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 animate-bounce text-amber-200" />
+                  <div className="text-left">
+                    <h4 className="text-[10px] uppercase font-black tracking-wider leading-none mb-1 text-amber-200">
+                      CAUTION AREA DETECTED
+                    </h4>
+                    <p className="text-xs font-black leading-tight text-white mb-0.5">
+                      {activeZoneAlert.zoneTitle}
+                    </p>
+                    <p className="text-xs font-extrabold text-orange-100">
+                      You are inside a caution area
+                    </p>
+                    <div className="flex flex-wrap gap-1.5 mt-1.5 text-[10px] font-semibold text-orange-100">
+                      <span className="bg-orange-700/80 px-2 py-0.5 rounded-md border border-orange-400/40">
+                        Category: {activeZoneAlert.category}
+                      </span>
+                      <span className="bg-orange-700/80 px-2 py-0.5 rounded-md border border-orange-400/40">
+                        {activeZoneAlert.incidentText}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setDismissedZoneId(activeZoneAlert.zoneId)}
+                  className="bg-white/20 hover:bg-white/30 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg transition shrink-0 cursor-pointer"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
+
         {/* Floating live Radar incident Warnings panel */}
         <AnimatePresence>
-          {proximityAlert && (
+          {proximityAlert && !activeZoneAlert && (
             <motion.div 
               initial={{ y: -50, opacity: 0 }} 
               animate={{ y: 0, opacity: 1 }} 
@@ -2726,7 +2838,7 @@ export default function MapPage() {
 
       {/* 2. Drag/Collapse Route Planning Bottom Sheet - Google Maps style */}
       <motion.div 
-        animate={{ height: isSheetExpanded ? '520px' : '230px' }}
+        animate={{ height: isSheetExpanded ? '560px' : '250px' }}
         transition={{ type: 'spring', stiffness: 300, damping: 30 }}
         id="collapsible-route-sheet"
         className={`relative rounded-t-3xl border-t z-[999] shadow-2xl flex flex-col overflow-hidden max-w-md mx-auto w-full shrink-0 transition-colors duration-300 ${
@@ -2752,7 +2864,7 @@ export default function MapPage() {
         </div>
 
         {/* SHEET SCROLLABLE MAIN BODY */}
-        <div className={`flex-1 overflow-y-auto px-4 py-3 space-y-4 text-left ${darkMode ? 'bg-slate-900' : 'bg-white'}`}>
+        <div className={`flex-1 overflow-y-auto px-4 pt-3 pb-28 space-y-4 text-left ${darkMode ? 'bg-slate-900' : 'bg-white'}`}>
           
           {permissionError && (
             <motion.div 
@@ -2786,8 +2898,15 @@ export default function MapPage() {
                   placeholder="Start Location"
                   value={startQuery}
                   onChange={(e) => {
-                    setStartQuery(e.target.value);
-                    setShowStartSuggestions(true);
+                    const val = e.target.value;
+                    setIsStartLinkedToGps(false);
+                    setGpsStartNotice(null);
+                    setStartQuery(val);
+                    if (val.trim() === '') {
+                      handleClearStartPoint();
+                    } else {
+                      setShowStartSuggestions(true);
+                    }
                   }}
                   onFocus={() => {
                     setShowStartSuggestions(true);
@@ -2800,9 +2919,10 @@ export default function MapPage() {
                 />
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button 
-                    onClick={() => { setStartPoint(PALANAN_CENTER); setStartQuery('Palanar Barangay Hall (Current)'); }}
+                    type="button"
+                    onClick={handleUseGpsForStart}
                     className={`p-1 ${darkMode ? 'text-slate-500 hover:text-blue-400' : 'text-slate-400 hover:text-blue-600'}`}
-                    title="Use center position"
+                    title="Use my location"
                   >
                     <Compass className="w-4 h-4" />
                   </button>
@@ -2833,6 +2953,8 @@ export default function MapPage() {
                         onClick={() => {
                           setStartPoint(p.latLng);
                           setStartQuery(p.name);
+                          setIsStartLinkedToGps(false);
+                          setGpsStartNotice(null);
                           setShowStartSuggestions(false);
                         }}
                         className={`w-full text-left p-2.5 rounded-xl transition-all flex items-start gap-2 ${
@@ -2947,6 +3069,43 @@ export default function MapPage() {
                 <span>Generate Safe Route</span>
               </button>
             </div>
+
+            {!startPoint && endPoint && (
+              <div className="mt-2 text-xs text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/60 p-2.5 rounded-xl flex items-center justify-between gap-2 animate-fade-in">
+                <span>{gpsStartNotice?.message || 'Waiting for a better GPS signal to use your current location...'}</span>
+                <div className="flex items-center gap-2 shrink-0">
+                  {gpsStartNotice?.canOpenSettings && (
+                    <button
+                      type="button"
+                      onClick={openGpsSettings}
+                      className="underline font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
+                    >
+                      Open settings
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setActiveInputField('start')}
+                    className="underline font-bold text-blue-600 dark:text-blue-400 cursor-pointer"
+                  >
+                    Pick start on map
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {errorMessage && (
+              <div className="bg-red-50 text-red-800 border border-red-200 text-xs font-semibold px-3 py-2 rounded-xl flex items-center justify-between gap-2 mt-2">
+                <span>⚠️ {errorMessage}</span>
+                <button
+                  type="button"
+                  onClick={() => calculateSafeDirections(startPoint, endPoint)}
+                  className="bg-red-600 hover:bg-red-700 text-white font-bold text-[10px] px-2.5 py-1 rounded-lg shrink-0 cursor-pointer"
+                >
+                  Retry
+                </button>
+              </div>
+            )}
           </div>
 
           <div className={`border-t my-2 ${darkMode ? 'border-slate-800' : 'border-slate-100'}`} />
@@ -3053,21 +3212,51 @@ export default function MapPage() {
                   </div>
                 </div>
 
-                {/* Safety Factors Dashboard factors matching active route */}
+                {/* Route score and factors matching active route */}
                 <div className="bg-white/5 rounded-xl p-2.5 border border-white/10 space-y-1.5 text-[10px]">
-                  <p className="font-extrabold uppercase tracking-wide text-indigo-300">Safety Score Breakdown Factors</p>
+                  <p className="font-extrabold uppercase tracking-wide text-indigo-300">Route Score Breakdown</p>
                   <div className="grid grid-cols-2 gap-1.5 px-1 text-slate-300">
-                    <div>🔰 Route Risk Level: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety.toUpperCase()}</strong></div>
-                    <div>🎯 Threat Zone Status: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety === 'safe' ? 'Fully Avoided' : activeRoute.safety === 'moderate' ? 'Near Perimeter' : 'Crosses Threat Zone'}</strong></div>
-                    <div>🛡️ Active Threat Detour: <strong className="text-white">{activeRoute.name.includes("Detour") || activeRoute.safety === 'safe' ? 'Active Safe Bypass' : 'Direct Path'}</strong></div>
-                    <div>🚨 Safety Rating Index: <strong className={activeScore >= 85 ? 'text-emerald-400' : activeScore >= 70 ? 'text-amber-400' : 'text-red-400'}>{activeScore}% Safe</strong></div>
+                    <div>🔰 Route score: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeScore}/100</strong></div>
+                    <div>🎯 Zone status: <strong className={activeRoute.safety === 'safe' ? 'text-emerald-400' : activeRoute.safety === 'moderate' ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety === 'safe' ? 'Fully Avoided' : activeRoute.safety === 'moderate' ? 'Near Perimeter' : 'Crosses Caution Area'}</strong></div>
+                    <div>🛡️ Path type: <strong className="text-white">{activeRoute.name.includes("Avoids") || activeRoute.name.includes("Detour") || activeRoute.safety === 'safe' ? 'Avoidance Path' : 'Direct Path'}</strong></div>
+                    <div>🚨 Status: <strong className={activeScore >= 85 ? 'text-emerald-400' : activeScore >= 70 ? 'text-amber-400' : 'text-red-400'}>{activeRoute.safety === 'safe' ? 'Cleared' : activeRoute.safety === 'moderate' ? 'Caution' : 'Elevated'}</strong></div>
                   </div>
                 </div>
               </div>
 
               {/* MULTIPLE ALTERNATIVE PATHS SELECTOR */}
-              <div className="space-y-1.5">
-                <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">CALCULATED ROUTE OPTIONS</p>
+              <div className="space-y-2">
+                <div className="flex justify-between items-center">
+                  <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest leading-none">SUGGESTED ROUTE OPTIONS</p>
+                  <span className="text-[10px] font-bold text-slate-500 font-mono">{routes.length} options available</span>
+                </div>
+
+                {isCheckingSaferRoutes && (
+                  <div className="flex items-center gap-1.5 text-xs text-blue-600 font-semibold animate-pulse py-0.5">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                    <span>Checking for safer routes...</span>
+                  </div>
+                )}
+
+                {routeWarning && (
+                  <div className="bg-amber-50 text-amber-900 border border-amber-200 text-xs font-semibold px-3 py-1.5 rounded-xl flex items-center justify-between gap-2">
+                    <div className="flex items-center gap-1.5">
+                      <span>ℹ️</span>
+                      <span>{routeWarning}</span>
+                    </div>
+                    {routeWarning.includes("Couldn't finish checking") && (
+                      <button
+                        type="button"
+                        onClick={handleRetrySaferSearch}
+                        disabled={isCheckingSaferRoutes}
+                        className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded-lg font-bold text-[11px] shrink-0 transition-colors cursor-pointer"
+                      >
+                        {isCheckingSaferRoutes ? 'Checking...' : 'Retry'}
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 <div className="flex gap-2.5 overflow-x-auto pb-1 max-w-full scrollbar-hide">
                   {routes.map((r, idx) => {
                     const isSelected = idx === activeRouteIndex;
@@ -3077,19 +3266,18 @@ export default function MapPage() {
                     return (
                       <button
                         key={`alt-choice-${idx}`}
-                        onClick={() => setActiveRouteIndex(idx)}
-                        className={`p-2.5 rounded-xl border flex-shrink-0 w-44 text-left transition-all relative ${
+                        onClick={() => selectRoute(idx)}
+                        className={`p-3 rounded-2xl border flex-shrink-0 w-52 text-left transition-all relative ${
                           isSelected 
                             ? 'bg-blue-50/90 border-blue-600 text-blue-950 ring-2 ring-blue-500 shadow-sm' 
                             : 'bg-slate-50 border-slate-200 hover:bg-slate-100 text-slate-700'
                         }`}
                       >
-                        <span className={`text-[10px] font-black block leading-snug line-clamp-2 ${isSelected ? 'text-blue-950' : 'text-slate-800'}`}>
-                          {r.name}
-                        </span>
-                        <div className="flex justify-between items-center mt-2 pt-1 border-t border-slate-200/60">
-                          <span className="text-xs font-black font-mono">{(r.distance / 1000).toFixed(2)} km</span>
-                          <span className={`text-[9px] font-black font-mono px-1.5 py-0.5 rounded-md border ${
+                        <div className="flex items-center justify-between gap-1">
+                          <span className={`text-[11px] font-black block leading-snug line-clamp-1 ${isSelected ? 'text-blue-950' : 'text-slate-900'}`}>
+                            {r.name}
+                          </span>
+                          <span className={`text-[9px] font-black font-mono px-1.5 py-0.5 rounded-md border shrink-0 ${
                             isSafe 
                               ? 'bg-emerald-100 text-emerald-800 border-emerald-300' 
                               : isModerate 
@@ -3099,10 +3287,47 @@ export default function MapPage() {
                             {r.safetyScore}%
                           </span>
                         </div>
+
+                        <div className="text-[11px] font-extrabold text-slate-700 font-mono mt-1">
+                          {(r.distance / 1000).toFixed(2)} km • {Math.max(1, Math.round(r.duration / 60))} min
+                        </div>
+
+                        {r.summaryText && (
+                          <p className="text-[10px] text-slate-500 font-medium line-clamp-2 mt-1.5 pt-1 border-t border-slate-200/70 leading-tight">
+                            {r.summaryText}
+                          </p>
+                        )}
                       </button>
                     );
                   })}
                 </div>
+
+                {activeRoute?.summaryText && (
+                  <div className="bg-slate-100 rounded-xl p-2.5 text-xs text-slate-700 font-semibold border border-slate-200 flex items-center gap-2">
+                    <span className="text-sm">🧭</span>
+                    <span>{activeRoute.summaryText}</span>
+                  </div>
+                )}
+                <p className="text-[10px] text-slate-400 italic text-center">Based on recorded incidents. Not a guarantee of safety.</p>
+
+                {showRouteDebug && activeRoute && (
+                  <div 
+                    id="route-debug-info-line" 
+                    className="text-[10px] font-mono bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border border-amber-300 dark:border-amber-800 rounded-lg px-2.5 py-1.5 flex items-center justify-between"
+                  >
+                    <span>
+                      Selected route: {activeRoute.coordinates.length} points, in-zone segments: {activeInZoneSegments.length}, drawn: {activeInZoneSegments.length}, pane/zIndex: inZoneHeatmapPane/620
+                    </span>
+                    <button 
+                      type="button" 
+                      onClick={() => setShowRouteDebug(false)} 
+                      className="text-amber-700 hover:text-amber-900 font-bold ml-2 text-[9px] cursor-pointer"
+                      title="Dismiss debug line"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                )}
               </div>
 
               {/* COMMUTE MOCK LIVE TRACKER CONTROLS */}
@@ -3119,7 +3344,7 @@ export default function MapPage() {
 
                 {!isSimulating ? (
                   <button 
-                    onClick={startSimulation}
+                    onClick={() => startSimulation(activeRouteIndex)}
                     className="w-full bg-slate-900 text-white hover:bg-slate-800 text-xs py-2 rounded-xl font-bold flex items-center justify-center gap-1.5 transition-all shadow-md active:scale-98"
                   >
                     <Play className="w-3.5 h-3.5 fill-white" /> Start Simulated Walk
@@ -3140,6 +3365,100 @@ export default function MapPage() {
                     </button>
                   </div>
                 )}
+
+                {/* Simulated Clock Override Selector (Active only during simulation) */}
+                <div className="pt-2 border-t border-slate-200/80 space-y-2">
+                  <div className="flex justify-between items-center text-[10px]">
+                    <span className="font-extrabold text-slate-700 flex items-center gap-1 uppercase tracking-wider">
+                      <Clock className="w-3 h-3 text-amber-500" /> Simulated Clock Override
+                    </span>
+                    {isSimulating && simulatedHour !== null ? (
+                      <span className="bg-amber-100 text-amber-900 px-2 py-0.5 rounded font-mono font-bold text-[10px]">
+                        Simulated time: {String(Math.floor(simulatedHour)).padStart(2, '0')}:{String(Math.round((simulatedHour % 1) * 60)).padStart(2, '0')}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] text-slate-400 font-semibold">
+                        Real Manila Time
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-4 gap-1 text-[11px] font-bold">
+                    <button
+                      type="button"
+                      disabled={!isSimulating}
+                      onClick={() => handleClockModeChange('now')}
+                      className={`py-1.5 px-1 rounded-xl text-center transition-all ${
+                        !isSimulating
+                          ? 'opacity-40 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : simClockMode === 'now'
+                          ? 'bg-slate-900 text-white shadow-xs'
+                          : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      Now
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!isSimulating}
+                      onClick={() => handleClockModeChange('10pm')}
+                      className={`py-1.5 px-1 rounded-xl text-center transition-all ${
+                        !isSimulating
+                          ? 'opacity-40 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : simClockMode === '10pm'
+                          ? 'bg-indigo-600 text-white shadow-xs'
+                          : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      10 PM
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!isSimulating}
+                      onClick={() => handleClockModeChange('2pm')}
+                      className={`py-1.5 px-1 rounded-xl text-center transition-all ${
+                        !isSimulating
+                          ? 'opacity-40 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : simClockMode === '2pm'
+                          ? 'bg-amber-600 text-white shadow-xs'
+                          : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      2 PM
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!isSimulating}
+                      onClick={() => handleClockModeChange('custom')}
+                      className={`py-1.5 px-1 rounded-xl text-center transition-all ${
+                        !isSimulating
+                          ? 'opacity-40 bg-slate-100 text-slate-400 cursor-not-allowed'
+                          : simClockMode === 'custom'
+                          ? 'bg-purple-600 text-white shadow-xs'
+                          : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                      }`}
+                    >
+                      Custom
+                    </button>
+                  </div>
+
+                  {isSimulating && simClockMode === 'custom' && (
+                    <div className="flex items-center gap-2 pt-1 bg-white p-2 rounded-xl border border-slate-200">
+                      <span className="text-[10px] font-bold text-slate-600 whitespace-nowrap">Hour:</span>
+                      <input
+                        type="range"
+                        min={0}
+                        max={23}
+                        value={customSimHour}
+                        onChange={(e) => handleClockModeChange('custom', parseInt(e.target.value, 10))}
+                        className="flex-1 accent-purple-600 cursor-pointer"
+                      />
+                      <span className="text-xs font-mono font-black text-purple-700 w-12 text-right">
+                        {String(customSimHour).padStart(2, '0')}:00
+                      </span>
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* TURN-BY-TURN ROUTE STEPS LIST */}
@@ -3185,18 +3504,31 @@ export default function MapPage() {
           ) : (
             
             /* EMPTY STATE SCREEN - Plan Your Safe Route */
-            <div id="palanan-map-empty-state-panel" className="flex flex-col justify-center items-center py-4 text-center space-y-3 select-none">
-              <div className="p-4 bg-blue-50 text-blue-600 rounded-full">
-                <MapIcon className="w-8 h-8 animate-bounce text-blue-600" />
+            <div id="palanan-map-empty-state-panel" className="flex flex-col justify-center items-center py-2 text-center space-y-2.5 select-none w-full max-w-xs mx-auto pb-4">
+              <div className="p-3 bg-blue-50 dark:bg-blue-950/50 text-blue-600 dark:text-blue-400 rounded-full">
+                <MapIcon className="w-7 h-7 text-blue-600 dark:text-blue-400" />
               </div>
-              <div className="space-y-1">
-                <h3 className="text-sm font-black text-slate-800">🗺️ Plan Your Safe Route</h3>
-                <div className="text-[11px] text-slate-500 max-w-[270px] leading-relaxed mx-auto space-y-1 mt-1 text-left bg-slate-50 p-3 rounded-2xl border border-slate-150">
-                  <div className="flex items-center gap-2"><span className="w-4 h-4 bg-blue-100 text-blue-600 text-[9px] font-bold flex items-center justify-center rounded-full">1</span> <span>Select Start Location</span></div>
-                  <div className="flex items-center gap-2"><span className="w-4 h-4 bg-blue-100 text-blue-600 text-[9px] font-bold flex items-center justify-center rounded-full">2</span> <span>Select Destination</span></div>
-                  <div className="flex items-center gap-2"><span className="w-4 h-4 bg-blue-100 text-blue-600 text-[9px] font-bold flex items-center justify-center rounded-full">3</span> <span>Generate Route</span></div>
+              <div className="space-y-1.5 w-full">
+                <h3 className={`text-sm font-black ${darkMode ? 'text-white' : 'text-slate-800'}`}>
+                  🗺️ Plan Your Safe Route
+                </h3>
+                <div className={`text-[11px] leading-relaxed mx-auto space-y-1.5 p-3 rounded-2xl border text-left ${
+                  darkMode ? 'bg-slate-950/80 border-slate-800 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-600'
+                }`}>
+                  <div className="flex items-center gap-2">
+                    <span className="w-4 h-4 bg-blue-100 dark:bg-blue-900/60 text-blue-600 dark:text-blue-300 text-[9px] font-bold flex items-center justify-center rounded-full shrink-0">1</span>
+                    <span className="font-semibold">Select Start Location</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-4 h-4 bg-blue-100 dark:bg-blue-900/60 text-blue-600 dark:text-blue-300 text-[9px] font-bold flex items-center justify-center rounded-full shrink-0">2</span>
+                    <span className="font-semibold">Select Destination</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="w-4 h-4 bg-blue-100 dark:bg-blue-900/60 text-blue-600 dark:text-blue-300 text-[9px] font-bold flex items-center justify-center rounded-full shrink-0">3</span>
+                    <span className="font-semibold">Generate Route</span>
+                  </div>
                 </div>
-                <p className="text-[10px] text-slate-400 mt-3 max-w-[240px] mx-auto text-center leading-relaxed font-semibold">
+                <p className="text-[10px] text-slate-400 mt-2 max-w-[260px] mx-auto text-center leading-relaxed font-semibold">
                   SafeRoute Lite will recommend the safest available route within Barangay Palanan.
                 </p>
               </div>

@@ -5,9 +5,10 @@ import L from 'leaflet';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
 import { syncReportToAllCollections } from '../lib/syncHelper';
-import { getCurrentGpsPosition, requestLocationPermission } from '../lib/nativeLocation';
+import { locationTracker } from '../lib/locationTracker';
 import { isInsidePalanan, PALANAN_BOUNDS } from '../lib/palananBounds';
 import { isDemoMode as calculateDemoMode } from '../config/demo';
+import { ZONE_LABEL, ZONE_LABEL_PLURAL } from '../constants/labels';
 import { 
   AlertTriangle, 
   AlertCircle,
@@ -96,19 +97,29 @@ export default function Report() {
     return 'General Hazard';
   };
 
-  // Real-time Geolocation trigger using existing native GPS implementation
+  // Real-time Geolocation trigger using shared locationTracker
   const handleGetLocation = async () => {
     setGeolocationLoading(true);
     setLocationError(null);
     setIsOutsidePalananState(false);
 
     try {
-      await requestLocationPermission();
-      const pos = await getCurrentGpsPosition();
+      await locationTracker.requestPermission();
+      const pos = await locationTracker.getFilteredPosition();
       
-      const lat = pos.latitude;
-      const lng = pos.longitude;
+      const [lat, lng] = pos.coords;
       const acc = pos.accuracy;
+
+      // Check if GPS fix is weak (>50m)
+      if (acc > 50) {
+        setLocation({ lat, lng });
+        setLocationAccuracy(acc);
+        setIsOutsidePalananState(false);
+        setLocationError(
+          `⚠️ GPS signal is weak (±${Math.round(acc)}m). Please wait a moment in an open area for a stronger GPS fix before pinning a report.`
+        );
+        return;
+      }
 
       // 1. Obtain and retain the user's ACTUAL GPS coordinates (NEVER substitute or clamp)
       const actualLocation = { lat, lng };
@@ -655,7 +666,7 @@ export default function Report() {
                 Registered Residents Only
               </h3>
               <p className={`text-xs leading-relaxed font-semibold ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>
-                Hazard reporting is strictly reserved for verified Barangay Palanan residents to prevent inaccurate, test, or false danger zones on the community map.
+                Hazard reporting is strictly reserved for verified Barangay Palanan residents to prevent inaccurate, test, or false {ZONE_LABEL_PLURAL.toLowerCase()} on the community map.
               </p>
               <div className="text-[11px] font-bold text-slate-400 border-t border-slate-100 dark:border-slate-800 pt-2.5 mt-2">
                 You are currently in Demo Mode (Guest). Please sign in with your registered account to submit hazard reports.

@@ -1,5 +1,5 @@
-import React from 'react';
-import { Outlet, NavLink } from 'react-router-dom';
+import React, { useRef } from 'react';
+import { Outlet, NavLink, useNavigate, useLocation } from 'react-router-dom';
 import { Home, Map, ShieldAlert, User, Bell } from 'lucide-react';
 import { useTheme } from '../context/ThemeContext';
 import { useAuth } from '../context/AuthContext';
@@ -10,6 +10,26 @@ export default function Layout() {
   const { darkMode } = useTheme();
   const { isDemoMode: authIsDemoMode, user, profile } = useAuth();
   const isDemo = authIsDemoMode ?? checkDemoMode(user, profile);
+  const navigate = useNavigate();
+  const location = useLocation();
+  const longPressTimerRef = useRef<NodeJS.Timeout | null>(null);
+
+  const startLongPress = () => {
+    longPressTimerRef.current = setTimeout(() => {
+      if (location.pathname === '/map') {
+        window.dispatchEvent(new CustomEvent('load-demo-trip'));
+      } else {
+        navigate('/map?demo=true');
+      }
+    }, 600);
+  };
+
+  const cancelLongPress = () => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  };
 
   const navItems = [
     { to: '/', icon: Home, label: 'Home' },
@@ -29,10 +49,18 @@ export default function Layout() {
         "px-4 py-3 border-b flex justify-between items-center sticky top-0 z-40 transition-colors duration-300",
         darkMode ? "bg-slate-900 border-slate-800" : "bg-white border-slate-100"
       )}>
-        <span className={cn(
-          "font-bold tracking-tight",
-          darkMode ? "text-white" : "text-slate-900"
-        )}>
+        <span
+          onMouseDown={startLongPress}
+          onMouseUp={cancelLongPress}
+          onMouseLeave={cancelLongPress}
+          onTouchStart={startLongPress}
+          onTouchEnd={cancelLongPress}
+          className={cn(
+            "font-bold tracking-tight select-none cursor-pointer",
+            darkMode ? "text-white" : "text-slate-900"
+          )}
+          title="SafeRoute Lite (Long-press to load demo trip)"
+        >
           SafeRoute Lite
         </span>
         {isDemo && (

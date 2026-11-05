@@ -1,5 +1,6 @@
 import { doc, setDoc, addDoc, collection, serverTimestamp } from 'firebase/firestore';
 import { db } from './firebase';
+import { getApiUrl } from './apiConfig';
 
 /**
  * Wraps any promise with a timeout. If the promise does not resolve within the given
@@ -43,7 +44,7 @@ export async function syncResidentToAllCollections(
 
   // Try server-side synchronization first (100% reliable, bypassing client security rules & iframe blocks)
   try {
-    const res = await fetch('/api/sync-resident', {
+    const res = await fetch(getApiUrl('/api/sync-resident'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
@@ -118,8 +119,7 @@ export async function syncResidentToAllCollections(
 }
 
 /**
- * Synchronizes single incident hazard reports or SOS distress alerts to all potential
- * incident report collections.
+ * Synchronizes single incident hazard reports to incident report collections.
  */
 export async function syncReportToAllCollections(reportData: {
   reporterId: string;
@@ -170,7 +170,7 @@ export async function syncReportToAllCollections(reportData: {
 
   // Try server-side synchronization first (100% reliable)
   try {
-    const res = await fetch('/api/sync-report', {
+    const res = await fetch(getApiUrl('/api/sync-report'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ reportId: idSafe, payload })
@@ -196,11 +196,8 @@ export async function syncReportToAllCollections(reportData: {
     updatedAt: serverTimestamp()
   };
 
-  // Sync to multiple collections for redundancy and bridging
+  // Sync to incident report collections
   const collections = ['reports', 'incident_reports'];
-  if (activePayload.status === 'approved' || reportData.description.includes('🚨')) {
-    collections.push('community_alerts');
-  }
 
   const promises = collections.map(async (collName) => {
     try {

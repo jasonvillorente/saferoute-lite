@@ -13,6 +13,7 @@ interface AuthContextType {
   isAdmin: boolean;
   isDemoMode: boolean;
   loginAsGuest: () => void;
+  setSessionUser: (userObj: any, profileObj: any) => void;
   signOut: () => Promise<void>;
   toggleUserRole: () => Promise<void>;
 }
@@ -23,6 +24,22 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const [user, setUser] = useState<User | null>(null);
   const [profile, setProfile] = useState<UserProfile | null>(null);
   const [loading, setLoading] = useState(true);
+
+  const setSessionUser = (userObj: any, profileObj: any) => {
+    try {
+      if (typeof window !== 'undefined') {
+        sessionStorage.removeItem('saferoute_just_signed_out');
+      }
+    } catch (e) {}
+    localStorage.removeItem('safe_route_guest');
+    localStorage.setItem('safe_route_registered_user', JSON.stringify({
+      user: userObj,
+      profile: profileObj
+    }));
+    setUser(userObj);
+    setProfile(profileObj);
+    setLoading(false);
+  };
 
   // Self-heal and migrate any local cached storage on initial load
   const loadLocalFallbackSession = () => {
@@ -88,30 +105,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     // Always subscribe to Firebase Auth state
     const unsubscribe = onAuthStateChanged(auth, async (firebaseUser) => {
-      // Check if user explicitly signed out recently
-      const justSignedOut = typeof window !== 'undefined' && sessionStorage.getItem('saferoute_just_signed_out') === '1';
-      if (justSignedOut) {
-        setUser(null);
-        setProfile(null);
-        setLoading(false);
-        return;
-      }
-
-      // If user is currently in explicit guest/demo mode, preserve guest session and do not override
-      const isGuestModeActive = typeof window !== 'undefined' && localStorage.getItem('safe_route_guest') !== null;
-      if (isGuestModeActive) {
-        if (firebaseUser) {
-          try {
-            await auth.signOut();
-          } catch (e) {}
-        }
-        loadLocalFallbackSession();
-        setLoading(false);
-        return;
-      }
-
       if (firebaseUser) {
-        // Authenticated with real Firebase Account -> Clear any guest markers!
+        // Authenticated with real Firebase Account -> Clear any guest and signout markers!
+        try {
+          if (typeof window !== 'undefined') {
+            sessionStorage.removeItem('saferoute_just_signed_out');
+          }
+        } catch (e) {}
         localStorage.removeItem('safe_route_guest');
         setUser(firebaseUser);
 
@@ -279,6 +279,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       isAdmin, 
       isDemoMode,
       loginAsGuest, 
+      setSessionUser,
       signOut,
       toggleUserRole 
     }}>

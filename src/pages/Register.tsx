@@ -1,14 +1,14 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import { createUserWithEmailAndPassword, updateProfile, GoogleAuthProvider, signInWithPopup } from 'firebase/auth';
 import { auth } from '../lib/firebase';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
-import { Shield, User, Mail, Lock, Loader2, Sparkles, UserCheck } from 'lucide-react';
+import { Shield, User, Mail, Lock, Loader2, UserCheck } from 'lucide-react';
 import { syncResidentToAllCollections, promiseWithTimeout } from '../lib/syncHelper';
 
 export default function Register() {
-  const { loginAsGuest } = useAuth();
+  const { setSessionUser } = useAuth();
   const { darkMode } = useTheme();
   const navigate = useNavigate();
 
@@ -19,6 +19,14 @@ export default function Register() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [successInfo, setSuccessInfo] = useState('');
+
+  useEffect(() => {
+    try {
+      if (typeof window !== 'undefined') {
+        sessionStorage.removeItem('saferoute_just_signed_out');
+      }
+    } catch (e) {}
+  }, []);
 
   const handleRegister = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -120,14 +128,15 @@ export default function Register() {
         }
       };
 
-      localStorage.removeItem('safe_route_guest');
-      localStorage.setItem('safe_route_registered_user', JSON.stringify(session));
-      setSuccessInfo('Account created successfully! Entering SafeRoute...');
+      try {
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem('saferoute_just_signed_out');
+        }
+      } catch (e) {}
 
-      setTimeout(() => {
-        navigate('/');
-        window.location.reload();
-      }, 800);
+      setSuccessInfo('Account created successfully! Entering SafeRoute...');
+      setSessionUser(session.user, session.profile);
+      navigate('/');
     } catch (err: any) {
       console.error('Registration error:', err);
       setError(err.message || 'Registration failed. Please check your information.');
@@ -140,6 +149,11 @@ export default function Register() {
     setLoading(true);
     setError('');
     try {
+      try {
+        if (typeof window !== 'undefined') {
+          sessionStorage.removeItem('saferoute_just_signed_out');
+        }
+      } catch (e) {}
       localStorage.removeItem('safe_route_guest');
       const provider = new GoogleAuthProvider();
       const result = await signInWithPopup(auth, provider);
@@ -285,18 +299,6 @@ export default function Register() {
           Google
         </button>
 
-        <button
-          type="button"
-          id="guest-register-btn"
-          onClick={loginAsGuest}
-          disabled={loading}
-          className={`w-full mt-3 font-bold py-4 rounded-2xl shadow-xs active:scale-[0.98] transition-all disabled:opacity-50 disabled:active:scale-100 flex items-center justify-center gap-2 cursor-pointer ${
-            darkMode ? 'bg-slate-800 text-slate-100 hover:bg-slate-700' : 'bg-slate-100 text-slate-800 hover:bg-slate-200'
-          }`}
-        >
-          <Sparkles className="w-5 h-5 text-amber-500 fill-amber-500" />
-          Enter as Guest (Demo Mode)
-        </button>
       </div>
 
       <div className="mt-8 text-center">
