@@ -11,6 +11,8 @@ import {
   getZoneMapStyles,
   ZONE_COLOR
 } from './zoneUtils';
+import { DangerZone, isZoneResolved } from '../types';
+import { getDistanceMeters } from './routeUtils';
 
 let totalTests = 0;
 let passedTests = 0;
@@ -60,6 +62,8 @@ assert(customNightZone.startHour === 20 && customNightZone.endHour === 4, 'Custo
 
 const allDayZone = normalizeDangerZone({
   id: 'z2',
+  latitude: 14.56038,
+  longitude: 120.99800,
   activeTime: 'all_day',
   startHour: 10,
   endHour: 14
@@ -69,6 +73,8 @@ assert(isZoneActiveNow(allDayZone), 'all_day zone is always active regardless of
 // 4. Default handling for old unmigrated records
 const oldRecord = normalizeDangerZone({
   id: 'old_1',
+  latitude: 14.56038,
+  longitude: 120.99800,
   name: 'Old Unmigrated Zone',
   riskLevel: 'high',
   active: true
@@ -135,8 +141,8 @@ const zonesWithHighCrimes = [
 assert(calculateHomeSafetyScore(zonesWithHighCrimes) === 60, 'Home safety score correctly caps crime contribution at 30 points');
 
 // 10. Simulated Clock Override Tests
-const nightZone = normalizeDangerZone({ id: 'nz-1', activeTime: 'night_only', startHour: 18, endHour: 5 });
-const dayZone = normalizeDangerZone({ id: 'dz-1', activeTime: 'day_only', startHour: 5, endHour: 18 });
+const nightZone = normalizeDangerZone({ id: 'nz-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'night_only', startHour: 18, endHour: 5 });
+const dayZone = normalizeDangerZone({ id: 'dz-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'day_only', startHour: 5, endHour: 18 });
 
 // A: When isSimulating is FALSE, simulatedHour override must NEVER be used (strictly real Manila time)
 const realTimeNightActive = isZoneActiveNow(nightZone);
@@ -165,12 +171,12 @@ assert(
 );
 
 // D: all_day zones remain active regardless of simulated time
-const simAllDayZone = normalizeDangerZone({ id: 'ad-1', activeTime: 'all_day' });
+const simAllDayZone = normalizeDangerZone({ id: 'ad-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'all_day' });
 assert(isZoneCurrentlyActive(simAllDayZone, true, 14) === true, 'All-day zone active during simulated 2 PM');
 assert(isZoneCurrentlyActive(simAllDayZone, true, 22) === true, 'All-day zone active during simulated 10 PM');
 
 // E: Resolved zones remain inactive even during simulation with override
-const resolvedNight = normalizeDangerZone({ id: 'rn-1', activeTime: 'night_only', isResolved: true });
+const resolvedNight = normalizeDangerZone({ id: 'rn-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'night_only', isResolved: true });
 assert(isZoneCurrentlyActive(resolvedNight, true, 22) === false, 'Resolved zone remains INACTIVE during simulated 10 PM');
 
 // 11. Single Color Rule tests (#EA580C)
@@ -331,5 +337,96 @@ for (const v of variations) {
   assert(activeStyle.dashArray === '', 'Active style always has solid border');
   assert(inactiveStyle.dashArray === '5, 5', 'Inactive style always has dashed border');
 }
+
+// 18. Missing-coordinate ingestion tests
+const missingLatRecord = normalizeDangerZone({ longitude: 120.99800 });
+assert(missingLatRecord.isResolved === true, 'Record missing latitude is marked resolved');
+assert(missingLatRecord.active === false, 'Record missing latitude is marked inactive');
+
+const missingLngRecord = normalizeDangerZone({ latitude: 14.56038 });
+assert(missingLngRecord.isResolved === true, 'Record missing longitude is marked resolved');
+assert(missingLngRecord.active === false, 'Record missing longitude is marked inactive');
+
+const completelyEmptyRecord = normalizeDangerZone({});
+assert(completelyEmptyRecord.isResolved === true, 'Completely empty record is marked resolved');
+assert(completelyEmptyRecord.active === false, 'Completely empty record is marked inactive');
+
+const validCoordRecord = normalizeDangerZone({ latitude: 14.56038, longitude: 120.99800, active: true });
+assert(validCoordRecord.isResolved === false, 'Record with valid Palanan coordinates is not marked resolved');
+assert(validCoordRecord.active === true, 'Record with valid Palanan coordinates is active');
+
+// 19. Proximity alert logic for stationary user across window transitions
+function evaluateProximityAlert(
+  userPos: [number, number],
+  allZones: DangerZone[],
+  isSim: boolean,
+  simHour: number | null,
+  currentEnteredId: string | null
+): string | null {
+  const activeNow = allZones.filter(z =>
+    z && !isZoneResolved(z) && z.active !== false && z.location &&
+    typeof z.location.lat === 'number' && typeof z.location.lng === 'number' &&
+    isZoneCurrentlyActive(z, isSim, simHour)
+  );
+
+  let insideZone: DangerZone | null = null;
+  for (const z of activeNow) {
+    const d = getDistanceMeters(userPos[0], userPos[1], z.location.lat, z.location.lng);
+    if (d <= z.radius) {
+      insideZone = z;
+      break;
+    }
+  }
+
+  if (insideZone) {
+    return insideZone.id;
+  } else if (currentEnteredId) {
+    const prevZone = allZones.find(z => z.id === currentEnteredId);
+    if (prevZone && prevZone.location) {
+      const d = getDistanceMeters(userPos[0], userPos[1], prevZone.location.lat, prevZone.location.lng);
+      const isStillActive = isZoneCurrentlyActive(prevZone, isSim, simHour);
+      if (d > prevZone.radius + 15 || !isStillActive) {
+        return null;
+      }
+      return currentEnteredId;
+    }
+    return null;
+  }
+  return null;
+}
+
+const stationaryPos: [number, number] = [14.56038, 120.99800];
+const windowTestZone = normalizeDangerZone({
+  id: 'trans-zone',
+  latitude: 14.56038,
+  longitude: 120.99800,
+  radius: 50,
+  activeTime: 'night_only',
+  startHour: 18,
+  endHour: 5,
+  active: true
+});
+
+// A: Stationary user when window opens (2 PM -> 10 PM)
+const alertAt2PM = evaluateProximityAlert(stationaryPos, [windowTestZone], true, 14, null);
+assert(alertAt2PM === null, 'Stationary user: alert is null while zone window is closed (2 PM)');
+
+const alertAt10PM = evaluateProximityAlert(stationaryPos, [windowTestZone], true, 22, null);
+assert(alertAt10PM === 'trans-zone', 'Stationary user: alert immediately triggers when window opens without motion');
+
+// B: Stationary user when window closes (10 PM -> 2 PM)
+const activeAlertId = 'trans-zone';
+const alertAfterWindowCloses = evaluateProximityAlert(stationaryPos, [windowTestZone], true, 14, activeAlertId);
+assert(alertAfterWindowCloses === null, 'Stationary user: alert clears immediately when window closes even within hysteresis buffer');
+
+// C: Hysteresis maintains alert if user steps slightly out while zone is STILL active
+const bufferPos: [number, number] = [14.56038 + 0.00048, 120.99800]; // ~53 meters away, zone radius = 50, threshold = 65m
+const alertWithinHysteresis = evaluateProximityAlert(bufferPos, [windowTestZone], true, 22, activeAlertId);
+assert(alertWithinHysteresis === 'trans-zone', 'Active zone: 15m exit hysteresis buffer preserves alert when moving just beyond radius');
+
+// D: Exiting beyond radius + 15m clears the alert
+const farPos: [number, number] = [14.56038 + 0.0008, 120.99800]; // ~88 meters away
+const alertBeyondHysteresis = evaluateProximityAlert(farPos, [windowTestZone], true, 22, activeAlertId);
+assert(alertBeyondHysteresis === null, 'Active zone: moving beyond radius + 15m clears alert');
 
 console.log(`\n--- TEST RUN FINISHED: ${passedTests}/${totalTests} PASSED ---`);

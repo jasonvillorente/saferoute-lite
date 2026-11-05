@@ -678,6 +678,54 @@ async function runTests() {
   const countRoute0Again = getRenderedInZoneCount(activeIndex);
   assert(countRoute0Again === countRoute0, 'the segment is redrawn after switching routes (switched back to route 0 -> orange segment restored)');
 
+  // TEST 31: Trip cache key ensures route cached during inactive window is never reused once zone window opens
+  clearSessionTripCache();
+  let tripFetchCount = 0;
+  const mockDynamicClockFetch = async (url: string) => {
+    tripFetchCount++;
+    const isDetour = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length === 3;
+    if (!isDetour) {
+      return (palananFixtures as any).direct;
+    }
+    return (palananFixtures as any).wp_right_124 || (palananFixtures as any).trip_925m_verified_avoiding;
+  };
+
+  // Step 1: At 2 PM (14:00), night-only zone is inactive
+  const resAt2PM = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [inactiveNightZone],
+    true,
+    14,
+    mockDynamicClockFetch
+  );
+  assert(tripFetchCount === 1, 'Cache test: Fresh calculation at 2 PM executes 1 fetch');
+  assert(resAt2PM.statusMessage === 'No active caution areas right now.', 'Cache test: 2 PM trip reports no active caution areas');
+
+  // Step 2: At 2 PM again with same params -> cache HIT (0 new fetches)
+  const resAt2PMRepeat = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [inactiveNightZone],
+    true,
+    14,
+    mockDynamicClockFetch
+  );
+  assert(tripFetchCount === 1, 'Cache test: Identical trip at 2 PM reuses cache (0 additional fetches)');
+
+  // Step 3: At 10 PM (22:00), the night-only zone opens!
+  // Trip cache key must differ because activeZoneKey changed -> Cache MISS, fresh calculation occurs
+  const resAt10PM = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [inactiveNightZone],
+    true,
+    22,
+    mockDynamicClockFetch
+  );
+  assert(tripFetchCount > 1, 'Cache test: Trip at 10 PM after zone opens creates distinct cache key (fresh fetch executed)');
+  assert(resAt10PM.statusMessage !== 'No active caution areas right now.', 'Cache test: 10 PM trip recognizes newly active zone and avoids/scores it');
+
   console.log(`\n--- ALL CONSOLIDATED TESTS PASSED: ${passedTests}/${totalTests} ---`);
 }
 

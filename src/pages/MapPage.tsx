@@ -500,7 +500,7 @@ export default function MapPage() {
   const darkMode = false;
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [permissionError, setPermissionError] = useState(false);
-  const [, setClockTick] = useState(0);
+  const [clockTick, setClockTick] = useState(0);
 
   // 1-minute clock tick to re-evaluate active time windows in real time while app is open
   useEffect(() => {
@@ -1068,12 +1068,13 @@ export default function MapPage() {
         playAlertBuzzer();
       }
     } else {
-      // 15 m exit buffer before re-triggering (hysteresis)
+      // 15 m exit buffer before re-triggering (hysteresis), or clear immediately if zone became inactive
       if (enteredZoneIdRef.current) {
         const prevZone = zones.find(z => z.id === enteredZoneIdRef.current);
         if (prevZone && prevZone.location) {
           const d = getDistanceMeters(lat, lng, prevZone.location.lat, prevZone.location.lng);
-          if (d > prevZone.radius + 15) {
+          const isStillActive = isZoneCurrentlyActive(prevZone, isSimulating, currentSimHourRef.current);
+          if (d > prevZone.radius + 15 || !isStillActive) {
             enteredZoneIdRef.current = null;
             setDismissedZoneId(null);
             setActiveZoneAlert(null);
@@ -1085,7 +1086,7 @@ export default function MapPage() {
         }
       }
     }
-  }, [currentLoc, userLocation, isSimulating, zones, gpsStatus, userAccuracy]);
+  }, [currentLoc, userLocation, isSimulating, zones, gpsStatus, userAccuracy, clockTick, simulatedHour]);
 
   // Demo trip query parameter (?demo=true) and custom event listener
   useEffect(() => {
@@ -2559,20 +2560,20 @@ export default function MapPage() {
 
 
         {/* Top Controls: Community Spots and GPS Status Chip side-by-side */}
-        <div className="absolute top-4 left-4 z-[990] flex items-start gap-2.5 max-w-[calc(100vw-32px)] pointer-events-none">
+        <div className="absolute top-2.5 left-2.5 right-2.5 z-[990] flex items-start justify-between gap-1.5 pointer-events-none">
           {/* Community Spots Pinpoint Control Bar & Legend */}
-          <div id="community-spots-map-control" className={`rounded-2xl shadow-xl border p-2.5 max-w-xs transition-colors duration-300 pointer-events-auto shrink-0 ${
-            darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white/95 backdrop-blur border-slate-200 text-slate-800'
+          <div id="community-spots-map-control" className={`rounded-xl shadow-lg border p-1.5 sm:p-2 max-w-[210px] sm:max-w-xs transition-colors duration-300 pointer-events-auto shrink ${
+            darkMode ? 'bg-slate-900/95 border-slate-800 text-white' : 'bg-white/95 backdrop-blur border-slate-200 text-slate-800'
           }`}>
-            <div className="flex items-center justify-between gap-2 pb-1.5 border-b border-slate-100 mb-2">
+            <div className="flex items-center justify-between gap-1 pb-1 border-b border-slate-100 mb-1">
               <button
                 type="button"
                 onClick={() => setShowCommunitySpots(!showCommunitySpots)}
-                className="flex items-center gap-1.5 text-xs font-black tracking-wide text-slate-800 hover:text-emerald-600 transition"
+                className="flex items-center gap-1 text-[11px] font-black tracking-tight text-slate-800 hover:text-emerald-600 transition"
               >
-                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shrink-0" />
-                <span>🌟 COMMUNITY SPOTS</span>
-                <span className="bg-emerald-100 text-emerald-800 text-[10px] px-1.5 py-0.2 rounded-full font-bold">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse shrink-0" />
+                <span>🌟 <span className="hidden sm:inline">COMMUNITY </span>SPOTS</span>
+                <span className="bg-emerald-100 text-emerald-800 text-[9px] px-1 py-0.2 rounded-full font-bold">
                   {activeApprovedSpots.length}
                 </span>
               </button>
@@ -2590,14 +2591,14 @@ export default function MapPage() {
                   setIsAddSpotModalOpen(false);
                   setIsPickingSpotOnMap(true);
                 }}
-                className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[10px] font-bold py-1 px-2.5 rounded-full flex items-center gap-1 shadow-xs transition-all cursor-pointer"
+                className="bg-emerald-600 hover:bg-emerald-700 active:scale-95 text-white text-[9px] font-bold py-0.5 px-2 rounded-full flex items-center gap-0.5 shadow-xs transition-all cursor-pointer shrink-0 whitespace-nowrap"
               >
-                <Plus className="w-3 h-3" /> Pin Spot
+                <Plus className="w-2.5 h-2.5" /> Pin
               </button>
             </div>
 
             {showCommunitySpots && (
-              <div className="flex flex-wrap gap-1">
+              <div className="flex flex-wrap gap-0.5 sm:gap-1">
                 {[
                   { id: 'all', label: 'All', icon: '📍' },
                   { id: 'safe_haven', label: 'Safe Haven', icon: '🛡️' },
@@ -2610,7 +2611,7 @@ export default function MapPage() {
                     key={cat.id}
                     type="button"
                     onClick={() => setSelectedSpotCategory(cat.id)}
-                    className={`px-2 py-0.5 rounded-lg text-[10px] font-bold flex items-center gap-1 transition-all ${
+                    className={`px-1.5 py-0.5 rounded-md text-[9px] font-bold flex items-center gap-0.5 transition-all ${
                       selectedSpotCategory === cat.id
                         ? 'bg-slate-900 text-white shadow-xs scale-105'
                         : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
@@ -2625,7 +2626,7 @@ export default function MapPage() {
           </div>
 
           {/* Real-Time GPS Status Chip & Recenter Badge placed beside Community Spots */}
-          <div className="shrink-0 pointer-events-auto">
+          <div className="shrink-0 pointer-events-auto ml-auto">
             <GpsStatusChip
               status={gpsStatus}
               isStale={isGpsStale}

@@ -49,7 +49,7 @@ export function normalizeDangerZone(raw: any, id: string = ''): DangerZone {
   const hasExplicitCoords = lat !== undefined && lng !== undefined;
   const isZeroCoords = hasExplicitCoords && lat === 0 && lng === 0;
   const isOutOfBounds = hasExplicitCoords && !isInsidePalanan(lat, lng);
-  const isInvalidCoords = isZeroCoords || isOutOfBounds;
+  const isInvalidCoords = !hasExplicitCoords || isZeroCoords || isOutOfBounds;
   const hasValidCoords = hasExplicitCoords && !isInvalidCoords;
 
   // If coordinates are explicitly 0/0, outside bounds, needsLocation is true, or already resolved -> mark resolved
