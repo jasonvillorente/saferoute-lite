@@ -2,6 +2,7 @@ import React from 'react';
 import { Marker, Circle, Popup } from 'react-leaflet';
 import L from 'leaflet';
 import { AlertCircle } from 'lucide-react';
+import { isMapDebugEnabled } from '../config/debugFlags';
 
 export interface UserLocationMarkerProps {
   position: [number, number];
@@ -14,6 +15,18 @@ export interface UserLocationMarkerProps {
   isSimulating?: boolean;
   autoFollow: boolean;
   onToggleAutoFollow: () => void;
+  debugCrosshair?: boolean;
+}
+
+/**
+ * Determines whether the separate Start Origin pin should be rendered.
+ * Hidden only while start is linked to "My location" (UserLocationMarker already represents it).
+ */
+export function shouldRenderStartPin(
+  startPoint: [number, number] | null,
+  isStartLinkedToGps: boolean
+): boolean {
+  return Boolean(startPoint) && !isStartLinkedToGps;
 }
 
 /**
@@ -22,6 +35,7 @@ export interface UserLocationMarkerProps {
  * - 3px crisp white border with soft drop shadow
  * - 60-degree soft blue directional beam when heading is known
  * - Expanding CSS pulse ring while acquiring / moving
+ * - Exact center alignment: iconSize [48, 48] and iconAnchor [24, 24] with zero negative margin offsets
  */
 export function createUserLocationPuckIcon(
   heading: number | null,
@@ -33,7 +47,7 @@ export function createUserLocationPuckIcon(
   const hasHeading = !isGrey && typeof heading === 'number' && !isNaN(heading);
 
   const html = `
-    <div class="user-location-puck relative flex items-center justify-center w-12 h-12 -ml-6 -mt-6 select-none pointer-events-auto">
+    <div class="user-location-puck relative flex items-center justify-center w-12 h-12 m-0 box-border select-none pointer-events-auto">
       ${
         hasHeading
           ? `
@@ -60,7 +74,7 @@ export function createUserLocationPuckIcon(
       `
           : ''
       }
-      <div class="user-location-dot relative rounded-full shadow-md transition-colors duration-300"
+      <div class="user-location-dot relative rounded-full shadow-md transition-colors duration-300 box-border"
            style="width: 18px; height: 18px; background-color: ${dotColor}; border: 3px solid #FFFFFF; box-shadow: 0 2px 6px rgba(0,0,0,0.32);">
       </div>
     </div>
@@ -71,6 +85,28 @@ export function createUserLocationPuckIcon(
     className: `custom-user-location-marker ${isGrey ? 'is-stale-marker' : 'is-active-marker'}`,
     iconSize: [48, 48],
     iconAnchor: [24, 24],
+  });
+}
+
+/**
+ * Dev/debug crosshair overlay centered at the exact [12, 12] coordinate anchor.
+ */
+export function createDebugCrosshairIcon(): L.DivIcon {
+  const html = `
+    <div class="user-debug-crosshair flex items-center justify-center w-6 h-6 m-0 pointer-events-none">
+      <svg width="24" height="24" viewBox="0 0 24 24" class="overflow-visible">
+        <line x1="0" y1="12" x2="24" y2="12" stroke="#DC2626" stroke-width="1.5" />
+        <line x1="12" y1="0" x2="12" y2="24" stroke="#DC2626" stroke-width="1.5" />
+        <circle cx="12" cy="12" r="2.5" fill="none" stroke="#DC2626" stroke-width="1.5" />
+      </svg>
+    </div>
+  `;
+
+  return L.divIcon({
+    html,
+    className: 'user-location-debug-crosshair pointer-events-none',
+    iconSize: [24, 24],
+    iconAnchor: [12, 12],
   });
 }
 
@@ -85,8 +121,10 @@ export const UserLocationMarker: React.FC<UserLocationMarkerProps> = ({
   isSimulating = false,
   autoFollow,
   onToggleAutoFollow,
+  debugCrosshair = isMapDebugEnabled(),
 }) => {
   const icon = createUserLocationPuckIcon(heading, isStale, isSimulating);
+  const crosshairIcon = debugCrosshair ? createDebugCrosshairIcon() : null;
 
   // Translucent blue accuracy circle: radius capped at 100m, hidden when simulating or stale
   const showAccuracyCircle = !isSimulating && !isStale && accuracy !== null && accuracy > 0;
@@ -145,6 +183,15 @@ export const UserLocationMarker: React.FC<UserLocationMarkerProps> = ({
           </div>
         </Popup>
       </Marker>
+
+      {crosshairIcon && (
+        <Marker
+          position={position}
+          icon={crosshairIcon}
+          interactive={false}
+          zIndexOffset={1200}
+        />
+      )}
 
       {showAccuracyCircle && (
         <Circle

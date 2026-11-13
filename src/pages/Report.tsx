@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MapContainer, TileLayer, Marker, useMapEvents, useMap, Rectangle } from 'react-leaflet';
+import { MapContainer, Marker, useMapEvents, useMap, Rectangle } from 'react-leaflet';
 import L from 'leaflet';
 import { useAuth } from '../context/AuthContext';
 import { useTheme } from '../context/ThemeContext';
@@ -9,6 +9,8 @@ import { locationTracker } from '../lib/locationTracker';
 import { isInsidePalanan, PALANAN_BOUNDS } from '../lib/palananBounds';
 import { isDemoMode as calculateDemoMode } from '../config/demo';
 import { ZONE_LABEL, ZONE_LABEL_PLURAL } from '../constants/labels';
+import { MAP_TILE_CONFIG, getTileUrl, isOsmStandardUrl } from '../constants/mapTiles';
+import { ResilientTileLayer } from '../components/ResilientTileLayer';
 import { 
   AlertTriangle, 
   AlertCircle,
@@ -77,6 +79,8 @@ export default function Report() {
   const [isOutsidePalananState, setIsOutsidePalananState] = useState(false);
   const [locationError, setLocationError] = useState<string | null>(null);
   const [showDemoModal, setShowDemoModal] = useState(false);
+  const [isUsingBackupMap, setIsUsingBackupMap] = useState(false);
+  const usingOsmTiles = isUsingBackupMap || isOsmStandardUrl(getTileUrl(darkMode));
 
   // References
   const descriptionInputRef = useRef<HTMLTextAreaElement>(null);
@@ -523,20 +527,22 @@ export default function Report() {
 
               {/* Interactive Leaflet Map Picker */}
               <div className={`h-60 relative w-full rounded-2xl overflow-hidden border shadow-sm z-10 ${
+                darkMode ? 'dark-map-tiles ' : ''
+              }${
+                usingOsmTiles ? 'osm-tiles ' : ''
+              }${
                 isOutsidePalananState 
                   ? (darkMode ? 'border-red-900/60' : 'border-red-300') 
                   : (darkMode ? 'border-blue-900/60' : 'border-blue-300')
               }`}>
                 <MapContainer 
                   center={[location.lat, location.lng]} 
-                  zoom={16} 
+                  zoom={16}
+                  maxZoom={MAP_TILE_CONFIG.maxZoom}
                   className="w-full h-full"
                   scrollWheelZoom={false}
                 >
-                  <TileLayer
-                    url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                    attribution='&copy; OpenStreetMap contributors'
-                  />
+                  <ResilientTileLayer darkMode={darkMode} onFallbackChange={setIsUsingBackupMap} />
                   <MapViewUpdater center={[location.lat, location.lng]} />
                   <MapEventsHandler onSelect={handleMapSelect} />
 
@@ -566,6 +572,18 @@ export default function Report() {
                     }}
                   />
                 </MapContainer>
+                {isUsingBackupMap && (
+                  <div
+                    data-testid="backup-map-notice"
+                    className={`absolute bottom-2 left-2 z-[500] px-2 py-0.5 rounded-md border text-[10px] font-semibold shadow-sm pointer-events-none ${
+                      darkMode
+                        ? 'bg-slate-900/90 border-slate-700 text-slate-300'
+                        : 'bg-white/95 border-slate-200 text-slate-600'
+                    }`}
+                  >
+                    Using backup map
+                  </div>
+                )}
               </div>
 
               <div className="space-y-1 pt-1">

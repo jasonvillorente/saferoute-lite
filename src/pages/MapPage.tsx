@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Circle, useMapEvents, Polyline, useMap } from 'react-leaflet';
+import { MapContainer, Marker, Popup, Circle, useMapEvents, Polyline, useMap } from 'react-leaflet';
 import { collection, query, where, onSnapshot, addDoc, setDoc, updateDoc, deleteDoc, doc, Timestamp, getDocs } from 'firebase/firestore';
 import L from 'leaflet';
 import { db } from '../lib/firebase';
@@ -21,11 +21,14 @@ import {
 import { isDemoMode as checkDemoMode } from '../config/demo';
 import { isInsidePalanan, PALANAN_BOUNDS, PALANAN_CENTER } from '../lib/palananBounds';
 import { useLocationTracker } from '../hooks/useLocationTracker';
-import { UserLocationMarker } from '../components/UserLocationMarker';
+import { shouldRenderStartPin, UserLocationMarker } from '../components/UserLocationMarker';
 import { GpsStatusChip } from '../components/GpsStatusChip';
-import { getDistanceToRouteMeters } from '../utils/offRouteDetector';
+import { evaluateOffRouteState } from '../utils/offRouteDetector';
 import { getRouteStartFromGps, GpsStartResult } from '../utils/gpsRouting';
 import { ZONE_LABEL, ZONE_LABEL_PLURAL, CAUTION_AREA_LABEL } from '../constants/labels';
+import { MAP_TILE_CONFIG, getTileUrl, isOsmStandardUrl } from '../constants/mapTiles';
+import { ResilientTileLayer } from '../components/ResilientTileLayer';
+import { isMapDebugEnabled } from '../config/debugFlags';
 import { 
   normalizeDangerZone, 
   isZoneActiveNow, 
@@ -501,6 +504,8 @@ export default function MapPage() {
   const [zones, setZones] = useState<DangerZone[]>([]);
   const [permissionError, setPermissionError] = useState(false);
   const [clockTick, setClockTick] = useState(0);
+  const [isUsingBackupMap, setIsUsingBackupMap] = useState(false);
+  const usingOsmTiles = isUsingBackupMap || isOsmStandardUrl(getTileUrl(darkMode));
 
   // 1-minute clock tick to re-evaluate active time windows in real time while app is open
   useEffect(() => {
@@ -617,14 +622,12 @@ export default function MapPage() {
     getFilteredPosition,
   } = useLocationTracker();
 
-  // Synchronize simulator position override with location tracker
+  // Ensure simulator override clears cleanly on unmount
   useEffect(() => {
-    if (isSimulating && currentLoc) {
-      setSimulatedOverride(currentLoc);
-    } else if (!isSimulating) {
+    return () => {
       setSimulatedOverride(null);
-    }
-  }, [isSimulating, currentLoc, setSimulatedOverride]);
+    };
+  }, [setSimulatedOverride]);
 
   // Keep startPoint synchronized with live position while linked to GPS before route generation
   useEffect(() => {
@@ -633,41 +636,62 @@ export default function MapPage() {
     }
   }, [isStartLinkedToGps, routeCalculated, userLocation]);
 
-  // Off-route detection state (user is > 50m from route start, OR > 40m from active route for >= 10 seconds)
+  // Off-route detection state (point-to-segment distance only: > 100m immediate, > 40m for 10s, clear <= 25m)
+  const mapDebugEnabled = isMapDebugEnabled();
   const [isOffRoute, setIsOffRoute] = useState(false);
+  const isOffRouteRef = useRef(false);
+  const setOffRouteState = (val: boolean) => {
+    isOffRouteRef.current = val;
+    setIsOffRoute(val);
+  };
+  const [showRecalculatePrompt, setShowRecalculatePrompt] = useState(false);
   const [offRouteDistance, setOffRouteDistance] = useState<number>(0);
+  const [offRouteDistToStart, setOffRouteDistToStart] = useState<number>(0);
   const offRouteTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     const activeRoute = routes[activeRouteIndex];
     if (!activeRoute || !activeRoute.coordinates || activeRoute.coordinates.length < 2 || !userLocation) {
-      setIsOffRoute(false);
+      setOffRouteState(false);
+      setShowRecalculatePrompt(false);
+      setOffRouteDistance(0);
+      setOffRouteDistToStart(0);
       offRouteTimerRef.current = null;
       return;
     }
 
-    const distToRoute = getDistanceToRouteMeters(userLocation, activeRoute.coordinates);
-    const distToStart = getDistanceMeters(
-      userLocation[0],
-      userLocation[1],
-      activeRoute.coordinates[0][0],
-      activeRoute.coordinates[0][1]
+    const res = evaluateOffRouteState(
+      userLocation,
+      activeRoute.coordinates,
+      isOffRouteRef.current,
+      offRouteTimerRef.current,
+      Date.now()
     );
-    const displayDist = Math.round(Math.max(distToRoute, distToStart));
-    setOffRouteDistance(displayDist);
+    offRouteTimerRef.current = res.timerStartMs;
+    setOffRouteDistance(Math.round(res.distToRoute));
+    setOffRouteDistToStart(Math.round(res.distToStart));
+    setShowRecalculatePrompt(res.showRecalculateFromHere);
+    setOffRouteState(res.isOffRoute);
 
-    // Trigger recalculation prompt immediately if > 50m from trip start, or after 10s if > 40m off route
-    if (distToStart > 50) {
-      setIsOffRoute(true);
-    } else if (distToRoute > 40) {
-      if (!offRouteTimerRef.current) {
-        offRouteTimerRef.current = Date.now();
-      } else if (Date.now() - offRouteTimerRef.current >= 10000) {
-        setIsOffRoute(true);
-      }
-    } else {
-      offRouteTimerRef.current = null;
-      setIsOffRoute(false);
+    if (res.timerStartMs !== null && !res.isOffRoute && res.distToRoute > 40) {
+      const remaining = Math.max(50, 10000 - (Date.now() - res.timerStartMs));
+      const timeoutId = window.setTimeout(() => {
+        const latestRoute = routes[activeRouteIndex];
+        if (!latestRoute?.coordinates || !userLocation) return;
+        const recheck = evaluateOffRouteState(
+          userLocation,
+          latestRoute.coordinates,
+          isOffRouteRef.current,
+          offRouteTimerRef.current,
+          Date.now()
+        );
+        offRouteTimerRef.current = recheck.timerStartMs;
+        setOffRouteDistance(Math.round(recheck.distToRoute));
+        setOffRouteDistToStart(Math.round(recheck.distToStart));
+        setShowRecalculatePrompt(recheck.showRecalculateFromHere);
+        setOffRouteState(recheck.isOffRoute);
+      }, remaining);
+      return () => clearTimeout(timeoutId);
     }
   }, [userLocation, routes, activeRouteIndex]);
 
@@ -1110,6 +1134,7 @@ export default function MapPage() {
     const demoStart: [number, number] = [14.55915, 120.99920];
     const demoEnd: [number, number] = [14.55565, 120.99920];
     setStartPoint(demoStart);
+    setIsStartLinkedToGps(false);
     setStartQuery('Demo Origin [14.55915, 120.99920]');
     setEndPoint(demoEnd);
     setEndQuery('Demo Destination [14.55565, 120.99920]');
@@ -1688,6 +1713,8 @@ export default function MapPage() {
       }
       if (!startPoint) {
         setStartPoint(gpsCoords);
+        setIsStartLinkedToGps(true);
+        setStartQuery('My location');
       }
       if (endPoint) {
         calculateSafeDirections(gpsCoords, endPoint);
@@ -1822,13 +1849,19 @@ export default function MapPage() {
       return;
     }
     const resolvedIndex = routes.indexOf(targetRoute) >= 0 ? routes.indexOf(targetRoute) : numericIndex;
+    const coords = targetRoute.coordinates;
+    if (!coords || coords.length === 0) return;
+
+    // Update tracker override synchronously to avoid 1-frame lag on off-route/UI checks
+    setSimulatedOverride(coords[0]);
     setActiveRouteIndex(resolvedIndex);
     setIsSimulating(true);
     setSimulatedIndex(0);
-    const coords = targetRoute.coordinates;
-    if (!coords || coords.length === 0) return;
     setCurrentLoc(coords[0]);
     setProximityAlert(null);
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
 
     if (simulationTimer.current) clearInterval(simulationTimer.current);
 
@@ -1837,6 +1870,8 @@ export default function MapPage() {
         const nextIdx = prev + 3; // Step faster to bypass long wait
         if (nextIdx >= coords.length) {
           clearInterval(simulationTimer.current!);
+          simulationTimer.current = null;
+          setSimulatedOverride(null);
           setIsSimulating(false);
           playAlertBuzzer();
           setCurrentLoc(coords[coords.length - 1]);
@@ -1848,6 +1883,7 @@ export default function MapPage() {
         }
 
         const point = coords[nextIdx];
+        setSimulatedOverride(point);
         setCurrentLoc(point);
 
         // Scan radar alert proximity limits using active simulated clock override
@@ -1877,6 +1913,9 @@ export default function MapPage() {
 
   // Switch selected route and keep simulator running if active
   const selectRoute = (idx: number) => {
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
     setActiveRouteIndex(idx);
     if (isSimulating) {
       startSimulation(idx);
@@ -1884,10 +1923,17 @@ export default function MapPage() {
   };
 
   const stopSimulation = () => {
+    setSimulatedOverride(null);
     setIsSimulating(false);
-    if (simulationTimer.current) clearInterval(simulationTimer.current);
+    if (simulationTimer.current) {
+      clearInterval(simulationTimer.current);
+      simulationTimer.current = null;
+    }
     setCurrentLoc(null);
     setProximityAlert(null);
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
     if (simClockMode !== 'now') {
       resetSimulationClock();
       recomputeRoutesWithClock(false, null);
@@ -1908,43 +1954,60 @@ export default function MapPage() {
   }, []);
 
   const triggerDetour = () => {
-    if (!currentLoc) return;
-    // Off-route displacement
+    const baseLoc = currentLoc || userLocation;
+    if (!baseLoc) return;
+    // Pause interval movement so walker holds the off-route position until Recalculate, route switch, or Halt
+    if (simulationTimer.current) {
+      clearInterval(simulationTimer.current);
+      simulationTimer.current = null;
+    }
+    // Off-route displacement (~185m > 100m immediate threshold)
     const offroadPoint: [number, number] = [
-      currentLoc[0] + 0.0012,
-      currentLoc[1] - 0.0012
+      baseLoc[0] + 0.0012,
+      baseLoc[1] - 0.0012
     ];
-    setStartPoint(offroadPoint);
+    setSimulatedOverride(offroadPoint);
     setCurrentLoc(offroadPoint);
-    setProximityAlert("GPS REROUTING: Off-course path detected. Re-evaluating safe streets...");
+    setProximityAlert("GPS REROUTING: Off-course path detected. Tap 'Recalculate from here' or halt simulation.");
     playAlertBuzzer();
-
-    setTimeout(() => {
-      calculateSafeDirections(offroadPoint, endPoint);
-    }, 1500);
   };
 
   const resetMapForm = () => {
+    setSimulatedOverride(null);
     setStartPoint(null);
+    setIsStartLinkedToGps(false);
     setEndPoint(null);
     setStartQuery('');
     setEndQuery('');
     setRouteCalculated(false);
     setRoutes([]);
     setIsSimulating(false);
-    if (simulationTimer.current) clearInterval(simulationTimer.current);
+    if (simulationTimer.current) {
+      clearInterval(simulationTimer.current);
+      simulationTimer.current = null;
+    }
     setCurrentLoc(null);
     setProximityAlert(null);
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
     setIsSheetExpanded(false);
   };
 
   const handleClearStartPoint = async () => {
+    setSimulatedOverride(null);
     setRouteCalculated(false);
     setRoutes([]);
     setIsSimulating(false);
-    if (simulationTimer.current) clearInterval(simulationTimer.current);
+    if (simulationTimer.current) {
+      clearInterval(simulationTimer.current);
+      simulationTimer.current = null;
+    }
     setCurrentLoc(null);
     setProximityAlert(null);
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
     setGpsStartNotice(null);
 
     // Clearing the field returns to "My location"
@@ -1998,7 +2061,22 @@ export default function MapPage() {
   };
 
   const handleRecalculateFromHere = async () => {
-    setIsOffRoute(false);
+    setOffRouteState(false);
+    setShowRecalculatePrompt(false);
+    offRouteTimerRef.current = null;
+
+    if (isSimulating && (currentLoc || userLocation) && endPoint) {
+      const simPos = (currentLoc || userLocation)!;
+      setSimulatedOverride(simPos);
+      setCurrentLoc(simPos);
+      setStartPoint(simPos);
+      setIsStartLinkedToGps(true);
+      setStartQuery('My location');
+      setProximityAlert(null);
+      await calculateSafeDirections(simPos, endPoint);
+      return;
+    }
+
     const res = await getRouteStartFromGps({
       waitForFix: true,
       timeoutMs: 10000,
@@ -2073,20 +2151,16 @@ export default function MapPage() {
     <div id="palanan-map-page-wrapper" className={`absolute inset-0 z-0 overflow-hidden flex flex-col -mx-4 -mt-4 ${darkMode ? 'bg-slate-950' : 'bg-slate-100'}`}>
       
       {/* 1. Main Background Map Frame - occupies 80-90% height */}
-      <div id="full-screen-map-container" className="relative flex-1 w-full h-full z-0">
+      <div id="full-screen-map-container" className={`relative flex-1 w-full h-full z-0 ${darkMode ? 'dark-map-tiles' : ''} ${usingOsmTiles ? 'osm-tiles' : ''}`}>
         <MapContainer 
           center={PALANAN_CENTER} 
-          zoom={17} 
+          zoom={17}
+          maxZoom={MAP_TILE_CONFIG.maxZoom}
           ref={mapRef}
           className="w-full h-full z-0" 
           zoomControl={false}
         >
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url={darkMode 
-              ? "https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png" 
-              : "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"}
-          />
+          <ResilientTileLayer darkMode={darkMode} onFallbackChange={setIsUsingBackupMap} />
           <MapEventsHandler onMapClick={handleMapSelection} onMapLongPress={setLongPressCoords} />
           <MapPanesSetup />
           
@@ -2396,8 +2470,8 @@ export default function MapPage() {
               );
             })}
 
-          {/* Start Point Pin */}
-          {startPoint && !currentLoc && (
+          {/* Start Point Pin: hidden only while start is linked to "My location" */}
+          {shouldRenderStartPin(startPoint, isStartLinkedToGps) && startPoint && (
             <>
               <Marker position={startPoint} icon={startIcon}>
                 <Popup><div className="text-xs font-bold text-slate-800">Start Origin (Point A)</div></Popup>
@@ -2429,6 +2503,7 @@ export default function MapPage() {
               isSimulating={isSimulating}
               autoFollow={autoFollowGps}
               onToggleAutoFollow={() => setAutoFollowGps(!autoFollowGps)}
+              debugCrosshair={mapDebugEnabled}
             />
           )}
 
@@ -2639,7 +2714,7 @@ export default function MapPage() {
           </div>
         </div>
 
-        {/* Off-Route Alert Notice with 10s persistence threshold */}
+        {/* Off-Route Alert Notice (> 100m immediate OR > 40m for 10s, clears <= 25m) */}
         {isOffRoute && userLocation && endPoint && (
           <div className="absolute top-16 left-4 right-4 z-[1050] bg-amber-500 text-white p-3 rounded-2xl shadow-xl flex items-center justify-between gap-3 animate-fade-in border border-amber-400">
             <div className="flex items-center gap-2 text-xs font-bold text-left">
@@ -2656,6 +2731,44 @@ export default function MapPage() {
             >
               Recalculate from here
             </button>
+          </div>
+        )}
+
+        {/* Separate Recalculate Prompt (> 40m from route line AND > 50m from route start) */}
+        {!isOffRoute && showRecalculatePrompt && userLocation && endPoint && (
+          <div className="absolute top-16 right-4 z-[1050] animate-fade-in">
+            <button
+              type="button"
+              onClick={handleRecalculateFromHere}
+              className="px-3 py-1.5 rounded-xl bg-white/95 text-amber-700 border border-amber-300 text-xs font-black shadow-lg hover:bg-amber-50 active:scale-95 transition cursor-pointer flex items-center gap-1.5"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+              Recalculate from here ({offRouteDistance}m off route)
+            </button>
+          </div>
+        )}
+
+        {/* Dev-only off-route debug telemetry line (strictly hidden in production builds) */}
+        {mapDebugEnabled && routes[activeRouteIndex] && userLocation && (
+          <div
+            data-testid="offroute-debug-line"
+            className="absolute top-16 left-4 z-[1040] px-2 py-1 rounded bg-slate-900/80 text-white text-[10px] font-mono pointer-events-none"
+          >
+            route:{offRouteDistance}m start:{offRouteDistToStart}m src:{isSimulating ? 'sim' : 'gps'} status:{isOffRoute ? 'off' : 'on'}
+          </div>
+        )}
+
+        {/* Small backup map notice when runtime fallback to OSM activates */}
+        {isUsingBackupMap && (
+          <div
+            data-testid="backup-map-notice"
+            className={`absolute bottom-4 left-4 z-[999] px-2.5 py-1 rounded-lg border text-[10px] font-semibold shadow-sm pointer-events-none ${
+              darkMode
+                ? 'bg-slate-900/90 border-slate-700 text-slate-300'
+                : 'bg-white/95 border-slate-200 text-slate-600'
+            }`}
+          >
+            Using backup map
           </div>
         )}
 
