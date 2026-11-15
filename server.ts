@@ -19,8 +19,12 @@ import {
   Timestamp 
 } from 'firebase/firestore';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const resolvedFilename = typeof __filename !== 'undefined'
+  ? __filename
+  : (typeof import.meta !== 'undefined' && import.meta.url ? fileURLToPath(import.meta.url) : path.join(process.cwd(), 'server.ts'));
+const resolvedDirname = typeof __dirname !== 'undefined'
+  ? __dirname
+  : path.dirname(resolvedFilename);
 
 const ipRateLimitMap = new Map<string, { count: number; resetTime: number }>();
 
