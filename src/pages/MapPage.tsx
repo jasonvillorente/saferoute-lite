@@ -24,7 +24,8 @@ import { useLocationTracker } from '../hooks/useLocationTracker';
 import { shouldRenderStartPin, UserLocationMarker } from '../components/UserLocationMarker';
 import { GpsStatusChip } from '../components/GpsStatusChip';
 import { evaluateOffRouteState } from '../utils/offRouteDetector';
-import { getRouteStartFromGps, GpsStartResult } from '../utils/gpsRouting';
+import { getRouteStartFromGps, GpsStartResult, shouldOfferRecalculateForImprovedFix } from '../utils/gpsRouting';
+import { checkApiHealth } from '../lib/apiConfig';
 import { ZONE_LABEL, ZONE_LABEL_PLURAL, CAUTION_AREA_LABEL } from '../constants/labels';
 import { MAP_TILE_CONFIG, getTileUrl, isOsmStandardUrl } from '../constants/mapTiles';
 import { ResilientTileLayer } from '../components/ResilientTileLayer';
@@ -526,7 +527,14 @@ export default function MapPage() {
     canOpenSettings?: boolean;
     offerPickOnMap?: boolean;
   } | null>(null);
+  const [gpsApproxNotice, setGpsApproxNotice] = useState<string | null>(null);
+  const [showImprovedFixRecalculate, setShowImprovedFixRecalculate] = useState(false);
   const [activeInputField, setActiveInputField] = useState<'start' | 'end' | null>(null);
+
+  // Startup backend health self-check (cached for session)
+  useEffect(() => {
+    checkApiHealth({ timeoutMs: 5000 }).catch(() => {});
+  }, []);
   
   // Suggestion visibility
   const [showStartSuggestions, setShowStartSuggestions] = useState(false);
@@ -629,12 +637,43 @@ export default function MapPage() {
     };
   }, [setSimulatedOverride]);
 
-  // Keep startPoint synchronized with live position while linked to GPS before route generation
+  // Keep startPoint synchronized with live valid position while linked to GPS before route generation
   useEffect(() => {
-    if (isStartLinkedToGps && !routeCalculated && userLocation) {
-      setStartPoint(userLocation);
+    if (!isStartLinkedToGps || routeCalculated) return;
+    if (gpsStatus === 'lost' || isGpsStale) {
+      setStartPoint(null);
+      setGpsApproxNotice(null);
+      setGpsStartNotice({
+        message: 'GPS signal lost. Pick start on map or wait for a fix.',
+        offerPickOnMap: true,
+      });
+      return;
     }
-  }, [isStartLinkedToGps, routeCalculated, userLocation]);
+    if (userLocation) {
+      setStartPoint(userLocation);
+      if (userAccuracy !== null && userAccuracy > 50 && userAccuracy <= 100 && !isSimulating) {
+        setGpsApproxNotice(`Using approximate location (±${Math.round(userAccuracy)} m)`);
+      } else if (userAccuracy !== null && userAccuracy <= 50) {
+        setGpsApproxNotice(null);
+      }
+    }
+  }, [isStartLinkedToGps, routeCalculated, userLocation, gpsStatus, isGpsStale, userAccuracy, isSimulating]);
+
+  // Offer "Recalculate from here" when a better/fresh fix arrives > 40m from "My location" start
+  useEffect(() => {
+    const offer = shouldOfferRecalculateForImprovedFix({
+      routeCalculated,
+      isStartLinkedToGps,
+      isSimulating,
+      routeStart: startPoint,
+      livePosition: userLocation,
+      status: gpsStatus,
+      isStale: isGpsStale,
+      accuracy: userAccuracy,
+      distanceFn: getDistanceMeters,
+    });
+    setShowImprovedFixRecalculate(offer);
+  }, [routeCalculated, isStartLinkedToGps, isSimulating, startPoint, userLocation, gpsStatus, isGpsStale, userAccuracy]);
 
   // Off-route detection state (point-to-segment distance only: > 100m immediate, > 40m for 10s, clear <= 25m)
   const mapDebugEnabled = isMapDebugEnabled();
@@ -995,10 +1034,9 @@ export default function MapPage() {
           setIsStartLinkedToGps(true);
           setStartQuery('My location');
           setGpsStartNotice(null);
-          if (res.notice) {
-            setRouteWarning(res.notice);
-          }
+          setGpsApproxNotice(res.notice || null);
         } else {
+          setGpsApproxNotice(null);
           setGpsStartNotice({
             message: res.message,
             canOpenSettings: res.canOpenSettings,
@@ -1135,6 +1173,8 @@ export default function MapPage() {
     const demoEnd: [number, number] = [14.55565, 120.99920];
     setStartPoint(demoStart);
     setIsStartLinkedToGps(false);
+    setGpsApproxNotice(null);
+    setShowImprovedFixRecalculate(false);
     setStartQuery('Demo Origin [14.55915, 120.99920]');
     setEndPoint(demoEnd);
     setEndQuery('Demo Destination [14.55565, 120.99920]');
@@ -1157,13 +1197,29 @@ export default function MapPage() {
       return;
     }
 
+    if (isStartLinkedToGps && !isSimulating && (gpsStatus === 'lost' || isGpsStale)) {
+      setGpsStartNotice({
+        message: 'GPS signal lost. Pick start on map or wait for a fix.',
+        offerPickOnMap: true,
+      });
+      setErrorMessage('GPS signal lost. Pick start on map or wait for a fix.');
+      return;
+    }
+
     setLoading(true);
     setIsCheckingSaferRoutes(true);
     setErrorMessage(null);
     setRouteWarning(null);
     setProximityAlert(null);
+    setShowImprovedFixRecalculate(false);
     setIsSimulating(false);
     if (simulationTimer.current) clearInterval(simulationTimer.current);
+
+    if (!isStartLinkedToGps) {
+      setGpsApproxNotice(null);
+    } else if (!isSimulating && userAccuracy !== null && userAccuracy > 50 && userAccuracy <= 100) {
+      setGpsApproxNotice(`Using approximate location (±${Math.round(userAccuracy)} m)`);
+    }
 
     const onProgress = (partial: any) => {
       if (partial.routes && partial.routes.length > 0) {
@@ -1225,12 +1281,14 @@ export default function MapPage() {
     }
   };
 
-  // Retry button handler: resumes only the unfinished safer route search and keeps shown routes
+  // Retry button handler: refreshes health check and retries safer route search keeping shown routes
   const handleRetrySaferSearch = async () => {
     if (!startPoint || !endPoint || isCheckingSaferRoutes) return;
     setIsCheckingSaferRoutes(true);
     setErrorMessage(null);
     setRouteWarning(null);
+
+    await checkApiHealth({ forceRefresh: true }).catch(() => {});
 
     const onProgress = (partial: any) => {
       if (partial.routes && partial.routes.length > 0) {
@@ -1253,7 +1311,7 @@ export default function MapPage() {
         currentSimHourRef.current,
         undefined,
         onProgress,
-        { forceRetry: true }
+        { forceRetry: true, isCurrentLocation: isStartLinkedToGps }
       );
       if (result.routes && result.routes.length > 0) {
         setRoutes(result.routes);
@@ -1301,6 +1359,8 @@ export default function MapPage() {
       setStartPoint(latLng);
       setIsStartLinkedToGps(false);
       setGpsStartNotice(null);
+      setGpsApproxNotice(null);
+      setShowImprovedFixRecalculate(false);
       setActiveInputField('end'); // Auto-advance to destination selection
     } else {
       setEndPoint(latLng);
@@ -1339,11 +1399,12 @@ export default function MapPage() {
         setStartPoint(res.point);
         setIsStartLinkedToGps(true);
         setStartQuery('My location');
+        setGpsApproxNotice(res.notice || null);
         if (res.notice) {
-          setRouteWarning(res.notice);
           setToastMessage(res.notice);
         }
       } else {
+        setGpsApproxNotice(null);
         setErrorMessage(res.message);
         setToastMessage(res.message);
         setGpsStartNotice({
@@ -1569,11 +1630,12 @@ export default function MapPage() {
         setStartPoint(res.point);
         setIsStartLinkedToGps(true);
         setStartQuery('My location');
+        setGpsApproxNotice(res.notice || null);
         if (res.notice) {
-          setRouteWarning(res.notice);
           setToastMessage(res.notice);
         }
       } else {
+        setGpsApproxNotice(null);
         setErrorMessage(res.message);
         setToastMessage(res.message);
         setGpsStartNotice({
@@ -1976,6 +2038,8 @@ export default function MapPage() {
     setSimulatedOverride(null);
     setStartPoint(null);
     setIsStartLinkedToGps(false);
+    setGpsApproxNotice(null);
+    setShowImprovedFixRecalculate(false);
     setEndPoint(null);
     setStartQuery('');
     setEndQuery('');
@@ -2007,8 +2071,10 @@ export default function MapPage() {
     setProximityAlert(null);
     setOffRouteState(false);
     setShowRecalculatePrompt(false);
+    setShowImprovedFixRecalculate(false);
     offRouteTimerRef.current = null;
     setGpsStartNotice(null);
+    setGpsApproxNotice(null);
 
     // Clearing the field returns to "My location"
     const res = await getRouteStartFromGps({ waitForFix: false });
@@ -2016,6 +2082,7 @@ export default function MapPage() {
       setStartPoint(res.point);
       setIsStartLinkedToGps(true);
       setStartQuery('My location');
+      setGpsApproxNotice(res.notice || null);
     } else {
       setStartPoint(null);
       setStartQuery('');
@@ -2045,11 +2112,12 @@ export default function MapPage() {
       setStartQuery('My location');
       setErrorMessage(null);
       setGpsStartNotice(null);
+      setGpsApproxNotice(res.notice || null);
       if (res.notice) {
         setToastMessage(res.notice);
-        setRouteWarning(res.notice);
       }
     } else {
+      setGpsApproxNotice(null);
       setErrorMessage(res.message);
       setToastMessage(res.message);
       setGpsStartNotice({
@@ -2063,6 +2131,7 @@ export default function MapPage() {
   const handleRecalculateFromHere = async () => {
     setOffRouteState(false);
     setShowRecalculatePrompt(false);
+    setShowImprovedFixRecalculate(false);
     offRouteTimerRef.current = null;
 
     if (isSimulating && (currentLoc || userLocation) && endPoint) {
@@ -2072,6 +2141,7 @@ export default function MapPage() {
       setStartPoint(simPos);
       setIsStartLinkedToGps(true);
       setStartQuery('My location');
+      setGpsApproxNotice(null);
       setProximityAlert(null);
       await calculateSafeDirections(simPos, endPoint);
       return;
@@ -2089,12 +2159,13 @@ export default function MapPage() {
       setStartPoint(res.point);
       setIsStartLinkedToGps(true);
       setStartQuery('My location');
+      setGpsApproxNotice(res.notice || null);
       if (res.notice) {
-        setRouteWarning(res.notice);
         setToastMessage(res.notice);
       }
       calculateSafeDirections(res.point, endPoint);
     } else if (!res.success) {
+      setGpsApproxNotice(null);
       setToastMessage(res.message);
       setGpsStartNotice({
         message: res.message,
@@ -2121,7 +2192,7 @@ export default function MapPage() {
   const activeTimeString = activeRoute ? `${Math.max(1, Math.ceil(activeRoute.duration / 60))} minutes` : "15 minutes";
   const activeScore = activeRoute ? activeRoute.safetyScore : 92;
 
-  const [showRouteDebug, setShowRouteDebug] = useState<boolean>(true);
+  const [showRouteDebug, setShowRouteDebug] = useState<boolean>(false);
   const showHeatmapSelfTest = typeof window !== 'undefined' && (
     new URLSearchParams(window.location.search).has('testHeatmap') ||
     (window as any).__SAFE_ROUTE_TEST_HEATMAP === true
@@ -2552,6 +2623,21 @@ export default function MapPage() {
                         lineJoin: 'round'
                       }}
                     />
+                    {/* 2. Short dashed snap connector when road endpoint is 5–40m from pinned destination */}
+                    {r.endSnapConnector && r.endSnapConnector.length === 2 && (
+                      <Polyline
+                        positions={r.endSnapConnector}
+                        pane="routeUnderlayPane"
+                        pathOptions={{
+                          pane: 'routeUnderlayPane',
+                          color: '#10B981',
+                          weight: 4,
+                          dashArray: '4, 8',
+                          opacity: 0.85,
+                          lineCap: 'round'
+                        }}
+                      />
+                    )}
                   </React.Fragment>
                 );
               })()}
@@ -2734,8 +2820,8 @@ export default function MapPage() {
           </div>
         )}
 
-        {/* Separate Recalculate Prompt (> 40m from route line AND > 50m from route start) */}
-        {!isOffRoute && showRecalculatePrompt && userLocation && endPoint && (
+        {/* Separate Recalculate Prompt (> 40m from route/start or improved fix > 40m from "My location") */}
+        {!isOffRoute && (showRecalculatePrompt || showImprovedFixRecalculate) && userLocation && endPoint && (
           <div className="absolute top-16 right-4 z-[1050] animate-fade-in">
             <button
               type="button"
@@ -2743,7 +2829,7 @@ export default function MapPage() {
               className="px-3 py-1.5 rounded-xl bg-white/95 text-amber-700 border border-amber-300 text-xs font-black shadow-lg hover:bg-amber-50 active:scale-95 transition cursor-pointer flex items-center gap-1.5"
             >
               <RotateCcw className="w-3.5 h-3.5" />
-              Recalculate from here ({offRouteDistance}m off route)
+              Recalculate from here{offRouteDistance > 0 ? ` (${offRouteDistance}m off route)` : ''}
             </button>
           </div>
         )}
@@ -3015,6 +3101,8 @@ export default function MapPage() {
                     const val = e.target.value;
                     setIsStartLinkedToGps(false);
                     setGpsStartNotice(null);
+                    setGpsApproxNotice(null);
+                    setShowImprovedFixRecalculate(false);
                     setStartQuery(val);
                     if (val.trim() === '') {
                       handleClearStartPoint();
@@ -3069,6 +3157,8 @@ export default function MapPage() {
                           setStartQuery(p.name);
                           setIsStartLinkedToGps(false);
                           setGpsStartNotice(null);
+                          setGpsApproxNotice(null);
+                          setShowImprovedFixRecalculate(false);
                           setShowStartSuggestions(false);
                         }}
                         className={`w-full text-left p-2.5 rounded-xl transition-all flex items-start gap-2 ${
@@ -3352,13 +3442,20 @@ export default function MapPage() {
                   </div>
                 )}
 
+                {isStartLinkedToGps && gpsApproxNotice && (
+                  <div className="bg-blue-50 text-blue-900 border border-blue-200 text-xs font-semibold px-3 py-1.5 rounded-xl flex items-center gap-1.5">
+                    <span>📡</span>
+                    <span>{gpsApproxNotice}</span>
+                  </div>
+                )}
+
                 {routeWarning && (
                   <div className="bg-amber-50 text-amber-900 border border-amber-200 text-xs font-semibold px-3 py-1.5 rounded-xl flex items-center justify-between gap-2">
                     <div className="flex items-center gap-1.5">
                       <span>ℹ️</span>
                       <span>{routeWarning}</span>
                     </div>
-                    {routeWarning.includes("Couldn't finish checking") && (
+                    {(routeWarning.includes("Couldn't finish checking") || routeWarning.includes("not reachable")) && (
                       <button
                         type="button"
                         onClick={handleRetrySaferSearch}
@@ -3424,7 +3521,7 @@ export default function MapPage() {
                 )}
                 <p className="text-[10px] text-slate-400 italic text-center">Based on recorded incidents. Not a guarantee of safety.</p>
 
-                {showRouteDebug && activeRoute && (
+                {mapDebugEnabled && showRouteDebug && activeRoute && (
                   <div 
                     id="route-debug-info-line" 
                     className="text-[10px] font-mono bg-amber-50 dark:bg-amber-950/40 text-amber-900 dark:text-amber-200 border border-amber-300 dark:border-amber-800 rounded-lg px-2.5 py-1.5 flex items-center justify-between"

@@ -50,7 +50,7 @@ function haversineDistanceMeters(lat1: number, lng1: number, lat2: number, lng2:
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware - Support larger payloads for hazard photo attachments & batch syncs
   app.use(express.json({ limit: '50mb' }));

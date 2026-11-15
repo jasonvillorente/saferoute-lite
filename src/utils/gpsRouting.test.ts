@@ -26,7 +26,8 @@ function assert(condition: boolean, message: string) {
 }
 
 async function runTests() {
-  const { getRouteStartFromGps } = await import('./gpsRouting');
+  const { getRouteStartFromGps, shouldOfferRecalculateForImprovedFix } = await import('./gpsRouting');
+  const { getDistanceMeters } = await import('./routeUtils');
   const { locationTracker } = await import('../lib/locationTracker');
   const { generateSuggestedRoutes, clearSessionTripCache } = await import('./routeUtils');
   const { PALANAN_CENTER } = await import('../lib/palananBounds');
@@ -293,6 +294,7 @@ async function runTests() {
     rawPosition: strongCoord,
     accuracy: 15,
     status: 'strong',
+    isStale: false,
     isOutsidePalanan: false,
   });
 
@@ -316,12 +318,85 @@ async function runTests() {
     position: null,
     accuracy: null,
     status: 'searching',
+    isStale: false,
   });
   const noFixRes = await getRouteStartFromGps({ waitForFix: false, tracker });
   const startPointNoFix = noFixRes.success ? noFixRes.point : null;
   const canGenerateNoFix = !!(startPointNoFix && destination);
   assert(canGenerateNoFix === false, 'Empty start without GPS fix keeps Generate button disabled');
   assert(noFixRes.success === false && noFixRes.offerPickOnMap === true, 'Shows reason and offers "Pick start on map" under button');
+
+  // --- Suite 6: Stale / Lost GPS Blocking & >40m Improved-Fix Recalculate ---
+  console.log('\nTest Suite 6: Stale / Lost GPS Blocking & Improved-Fix Recalculate');
+
+  // Lost status even with cached position
+  (tracker as any).updateState({
+    position: strongCoord,
+    rawPosition: strongCoord,
+    accuracy: 15,
+    status: 'lost',
+    isStale: false,
+    isOutsidePalanan: false,
+    isSimulating: false,
+  });
+  const resLost = await getRouteStartFromGps({ waitForFix: true, tracker });
+  assert(resLost.success === false, 'status === "lost" blocks routing even if old position exists');
+  if (!resLost.success) {
+    assert(resLost.reason === 'lost', 'status === "lost" returns reason = "lost"');
+    assert(resLost.message === 'GPS signal lost. Pick start on map or wait for a fix.', 'Lost GPS shows required message');
+    assert(resLost.offerPickOnMap === true, 'Lost GPS offers "Pick start on map"');
+  }
+
+  // Stale cached fix (isStale === true, e.g. from localStorage on cold start)
+  (tracker as any).updateState({
+    position: strongCoord,
+    rawPosition: strongCoord,
+    accuracy: 20,
+    status: 'searching',
+    isStale: true,
+    isOutsidePalanan: false,
+    isSimulating: false,
+  });
+  const resStale = await getRouteStartFromGps({ waitForFix: false, tracker });
+  assert(resStale.success === false, 'isStale === true blocks routing');
+  if (!resStale.success) {
+    assert(resStale.reason === 'lost', 'isStale === true returns reason = "lost"');
+    assert(resStale.message === 'GPS signal lost. Pick start on map or wait for a fix.', 'Stale GPS shows required message');
+  }
+
+  // Improved-fix recalculate helper (> 40m shift vs <= 40m)
+  const calcStart: [number, number] = [14.5580, 120.9990];
+  const moved20m: [number, number] = [14.5580 + 20 / 111000, 120.9990];
+  const moved55m: [number, number] = [14.5580 + 55 / 111000, 120.9990];
+
+  assert(
+    shouldOfferRecalculateForImprovedFix({
+      routeCalculated: true,
+      isStartLinkedToGps: true,
+      isSimulating: false,
+      routeStart: calcStart,
+      livePosition: moved20m,
+      status: 'strong',
+      isStale: false,
+      accuracy: 10,
+      distanceFn: getDistanceMeters,
+    }) === false,
+    'Improved fix moved <= 40m (20m) does NOT show Recalculate prompt'
+  );
+  assert(
+    shouldOfferRecalculateForImprovedFix({
+      routeCalculated: true,
+      isStartLinkedToGps: true,
+      isSimulating: false,
+      routeStart: calcStart,
+      livePosition: moved55m,
+      status: 'strong',
+      isStale: false,
+      accuracy: 10,
+      distanceFn: getDistanceMeters,
+    }) === true,
+    'Better fix moved > 40m (55m) after "My location" route triggers "Recalculate from here"'
+  );
 
   console.log(`\nResults: ${passed} passed, ${failed} failed\n`);
   if (failed > 0) {

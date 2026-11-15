@@ -122,6 +122,14 @@ export interface RouteSegment {
   crimeCount?: number;
 }
 
+export type AvoidanceStatus =
+  | 'found'
+  | 'no_avoiding_route_found'
+  | 'inside_zone'
+  | 'no_active_zones'
+  | 'requests_failed'
+  | 'service_unreachable';
+
 export interface CalculatedRoute {
   id?: string;
   coordinates: [number, number][];
@@ -147,6 +155,8 @@ export interface CalculatedRoute {
   extraDistance?: number;
   extraDuration?: number;
   minClearance?: number;
+  endSnapConnector?: [number, number][];
+  endErrorMeters?: number;
 }
 
 export interface Notification {

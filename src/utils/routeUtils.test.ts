@@ -13,7 +13,14 @@ import {
   createZoneAvoidPolygon,
   RawRouteCandidate
 } from './routeUtils';
-import { getApiUrl, getApiBaseUrl } from '../lib/apiConfig';
+import {
+  getApiUrl,
+  getApiBaseUrl,
+  isNativeMissingApiBaseUrl,
+  checkApiHealth,
+  clearApiHealthCache
+} from '../lib/apiConfig';
+import { isMapDebugEnabled } from '../config/debugFlags';
 import palananFixtures from './fixtures/palananTripFixtures.json';
 
 let passedTests = 0;
@@ -81,7 +88,7 @@ async function runTests() {
   const tripEnd: [number, number] = [14.55565, 120.99920];
 
   const mockFixtureFetch = async (url: string) => {
-    const isDetour = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length === 3;
+    const isDetour = (url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length ?? 0) >= 3;
     if (!isDetour) {
       return (palananFixtures as any).direct;
     }
@@ -390,7 +397,7 @@ async function runTests() {
   let fetchHits = 0;
   const countingFetch = async (url: string) => {
     fetchHits++;
-    const isDetour = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length === 3;
+    const isDetour = (url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length ?? 0) >= 3;
     if (!isDetour) return (palananFixtures as any).direct;
     return (palananFixtures as any).trip_925m_verified_avoiding;
   };
@@ -407,7 +414,7 @@ async function runTests() {
   clearSessionTripCache();
   let detourAttemptsWith429 = 0;
   const mock429Fetch = async (url: string) => {
-    const isDetour = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length === 3;
+    const isDetour = (url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length ?? 0) >= 3;
     if (!isDetour) return (palananFixtures as any).direct;
     detourAttemptsWith429++;
     // Simulate HTTP 429 response
@@ -683,7 +690,7 @@ async function runTests() {
   let tripFetchCount = 0;
   const mockDynamicClockFetch = async (url: string) => {
     tripFetchCount++;
-    const isDetour = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length === 3;
+    const isDetour = (url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length ?? 0) >= 3;
     if (!isDetour) {
       return (palananFixtures as any).direct;
     }
@@ -725,6 +732,420 @@ async function runTests() {
   );
   assert(tripFetchCount > 1, 'Cache test: Trip at 10 PM after zone opens creates distinct cache key (fresh fetch executed)');
   assert(resAt10PM.statusMessage !== 'No active caution areas right now.', 'Cache test: 10 PM trip recognizes newly active zone and avoids/scores it');
+
+  // TEST 32: Native base URL with no configuration returns "", no hardcoded ais-dev URL, skips ORS, shows unreachable message
+  clearSessionTripCache();
+  clearApiHealthCache();
+  assert(!getApiBaseUrl({ isNative: true }).includes('ais-dev-'), 'getApiBaseUrl never returns hardcoded ais-dev preview URL');
+  assert(isNativeMissingApiBaseUrl({ isNative: true }) === true, 'Native build with no VITE_API_BASE_URL reports missing base URL');
+
+  const directOnlyFetch = async (url: string) => {
+    const coordsCount = url.split('/foot/')[1]?.split('?')[0]?.split(';')?.length ?? 0;
+    if (coordsCount <= 2) return (palananFixtures as any).direct;
+    return null;
+  };
+
+  const nativeUnreachableRes = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [recordedTripZone],
+    false,
+    null,
+    directOnlyFetch,
+    undefined,
+    { isNative: true }
+  );
+  assert(
+    nativeUnreachableRes.avoidanceStatus === 'service_unreachable',
+    `Native missing API base URL skips ORS and reports service_unreachable (got ${nativeUnreachableRes.avoidanceStatus})`
+  );
+  assert(
+    nativeUnreachableRes.statusMessage === 'Safer-route service is not reachable. Showing the fastest route only.',
+    'Native unreachable status message matches exact required string'
+  );
+
+  // TEST 33: 302 redirect, HTML response, and CORS TypeError in ORS / health check set failure state (never "No route found")
+  clearSessionTripCache();
+  clearApiHealthCache();
+  const redirectHealth = await checkApiHealth({
+    forceRefresh: true,
+    fetchFn: async () => ({ status: 302, type: 'opaqueredirect', redirected: true, url: 'https://example.com/__cookie_check.html', ok: false } as any)
+  });
+  assert(!redirectHealth.ok && redirectHealth.reason === 'redirect', 'checkApiHealth detects 302 / __cookie_check redirect');
+
+  const htmlHealth = await checkApiHealth({
+    forceRefresh: true,
+    fetchFn: async () => ({
+      status: 200,
+      ok: true,
+      headers: { get: () => 'text/html; charset=utf-8' },
+      text: async () => '<!DOCTYPE html><html>Sign in</html>'
+    } as any)
+  });
+  assert(!htmlHealth.ok && htmlHealth.reason === 'non_json', 'checkApiHealth detects HTML non-JSON response');
+
+  const corsHealth = await checkApiHealth({
+    forceRefresh: true,
+    fetchFn: async () => { throw new TypeError('Failed to fetch'); }
+  });
+  assert(!corsHealth.ok && corsHealth.reason === 'cors_or_network', 'checkApiHealth detects CORS TypeError');
+
+  clearSessionTripCache();
+  const orsRedirectRes = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [recordedTripZone],
+    false,
+    null,
+    directOnlyFetch,
+    undefined,
+    {
+      orsRawFetchFn: async () => ({ status: 302, type: 'opaqueredirect', redirected: true, url: 'https://host/__cookie_check', ok: false } as any)
+    }
+  );
+  assert(
+    orsRedirectRes.avoidanceStatus === 'service_unreachable' && orsRedirectRes.diagnostics.requestsFailedOrTimedOut === true,
+    'ORS 302 redirect sets failure/unreachable state'
+  );
+  assert(
+    orsRedirectRes.statusMessage !== 'No route that avoids all caution areas was found.',
+    'ORS 302 redirect does NOT show false "No route that avoids all caution areas was found."'
+  );
+
+  clearSessionTripCache();
+  const orsCorsRes = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [recordedTripZone],
+    false,
+    null,
+    directOnlyFetch,
+    undefined,
+    {
+      orsRawFetchFn: async () => { throw new TypeError('CORS blocked'); }
+    }
+  );
+  assert(
+    orsCorsRes.avoidanceStatus === 'service_unreachable' && orsCorsRes.diagnostics.requestsFailedOrTimedOut === true,
+    'ORS CORS TypeError sets failure/unreachable state'
+  );
+
+  clearSessionTripCache();
+  const orsHtmlRes = await generateSuggestedRoutes(
+    tripStart,
+    tripEnd,
+    [recordedTripZone],
+    false,
+    null,
+    directOnlyFetch,
+    undefined,
+    {
+      orsRawFetchFn: async () => ({
+        status: 200,
+        ok: true,
+        type: 'basic',
+        url: 'https://example.com/api/directions/ors',
+        headers: { get: () => 'text/html' },
+        text: async () => '<html><body>Login</body></html>'
+      } as any)
+    }
+  );
+  assert(
+    orsHtmlRes.avoidanceStatus === 'service_unreachable' && orsHtmlRes.diagnostics.requestsFailedOrTimedOut === true,
+    'ORS HTML response sets failure/unreachable state'
+  );
+
+  // TEST 34: Two-via-point fallback on a short 160m grid sends 4 coordinates (start;wpBefore;wpAfter;end) and succeeds
+  clearSessionTripCache();
+  const shortStart: [number, number] = [14.5581, 120.9992];
+  const shortEnd: [number, number] = [14.5567, 120.9992];
+  const shortZone = normalizeDangerZone({
+    id: 'z-short-grid',
+    location: { lat: 14.5574, lng: 120.9992 },
+    radius: 50,
+    active: true,
+    activeTime: 'all_day',
+    crimeCount: 4
+  });
+
+  const capturedCoordCounts: number[] = [];
+  const shortGridFetch = async (url: string) => {
+    const segs = url.split('/foot/')[1]?.split('?')[0]?.split(';') || [];
+    capturedCoordCounts.push(segs.length);
+    if (segs.length === 2) {
+      return {
+        code: 'Ok',
+        routes: [{
+          distance: 156,
+          duration: 120,
+          legs: [],
+          geometry: {
+            coordinates: [
+              [120.9992, 14.5581],
+              [120.9992, 14.5574],
+              [120.9992, 14.5567]
+            ]
+          }
+        }]
+      };
+    }
+    // Verify 4 coordinates (start;wpBefore;wpAfter;end) are sent for two-via-point detour
+    if (segs.length === 4) {
+      const wp1Lng = Number(segs[1].split(',')[0]);
+      if (wp1Lng > 120.9992) {
+        return {
+          code: 'Ok',
+          routes: [{
+            distance: 320,
+            duration: 245,
+            legs: [],
+            geometry: {
+              coordinates: [
+                [120.9992, 14.5581],
+                [121.0001, 14.5581],
+                [121.0001, 14.5567],
+                [120.9992, 14.5567]
+              ]
+            }
+          }]
+        };
+      }
+    }
+    return { code: 'NoRoute', routes: [] };
+  };
+
+  const shortGridRes = await generateSuggestedRoutes(
+    shortStart,
+    shortEnd,
+    [shortZone],
+    false,
+    null,
+    shortGridFetch
+  );
+  assert(capturedCoordCounts.some(c => c === 4), 'Two-via-point fallback sends 4 coordinates (start;wpBefore;wpAfter;end)');
+  assert(shortGridRes.routes.some(r => r.name.startsWith('Avoids caution areas')), 'Short grid two-via-point fallback finds verified avoiding route');
+
+  // TEST 35: 0m inside with clearance < 10m gets "Passes close to a caution area (X m from edge)" (never "Least time"),
+  // Fastest with clearance < 10m is never labeled "avoids", and better 0m-inside candidate is kept over closer 0m-inside Fastest
+  const closeZone = normalizeDangerZone({
+    id: 'z-close-pass',
+    location: { lat: 14.55740, lng: 120.99920 },
+    radius: 50,
+    active: true,
+    activeTime: 'all_day',
+    crimeCount: 3
+  });
+  const fastest2mRoute: RawRouteCandidate = {
+    coordinates: [
+      [14.55900, 120.99920],
+      [14.55740, 120.99920 + 52 * lngDegTrip], // 2m outside 50m radius -> 0m inside, minClearance ~2m
+      [14.55580, 120.99920]
+    ],
+    distance: 360,
+    duration: 270,
+    steps: []
+  };
+  const close7mRoute: RawRouteCandidate = {
+    coordinates: [
+      [14.55900, 120.99920],
+      [14.55900, 120.99920 + 120 * lngDegTrip],
+      [14.55740, 120.99920 + 57 * lngDegTrip], // 7m outside 50m radius -> 0m inside, minClearance ~7m
+      [14.55580, 120.99920 + 120 * lngDegTrip],
+      [14.55580, 120.99920]
+    ],
+    distance: 560,
+    duration: 420,
+    steps: []
+  };
+
+  const closePassResult = processRoutePipeline({
+    candidates: [fastest2mRoute, close7mRoute],
+    start: [14.55900, 120.99920],
+    end: [14.55580, 120.99920],
+    zones: [closeZone],
+    isSim: false,
+    simHour: null
+  });
+
+  assert(
+    !closePassResult.routes[0].name.toLowerCase().includes('avoids'),
+    `Fastest with minClearance < 10m is NOT labeled "avoids" (got "${closePassResult.routes[0].name}")`
+  );
+  assert(
+    closePassResult.routes.length === 2 &&
+    closePassResult.routes[1].name.includes('Passes close to a caution area') &&
+    closePassResult.routes[1].name.includes('m from edge)'),
+    `0m-inside candidate with better clearance than 0m-inside Fastest is kept and labeled Passes close (got "${closePassResult.routes[1]?.name}")`
+  );
+  assert(
+    !closePassResult.routes.some(r => r.name === 'Least time in caution area'),
+    '0m-inside close-pass route is NEVER labeled "Least time in caution area"'
+  );
+
+  // TEST 36: Near-duplicate pool iteration (iterates past avoidingPool[0] if [0] is near-duplicate of Fastest)
+  const poolZone = normalizeDangerZone({
+    id: 'z-pool-dup',
+    location: { lat: 14.55740, lng: 120.99920 },
+    radius: 50,
+    active: true,
+    activeTime: 'all_day',
+    crimeCount: 4
+  });
+  // Fastest cuts edge slightly (clearance 8m < 10m)
+  const fastestNearDupSource: RawRouteCandidate = {
+    coordinates: [
+      [14.55900, 120.99920],
+      [14.55740, 120.99920 + 58 * lngDegTrip],
+      [14.55580, 120.99920]
+    ],
+    distance: 370,
+    duration: 280,
+    steps: []
+  };
+  // avoidingPool[0]: clearance 12m >= 10m, but shifted only 4m laterally -> near-duplicate within 30m of Fastest!
+  const avoidNearDup0: RawRouteCandidate = {
+    coordinates: [
+      [14.55900, 120.99920],
+      [14.55740, 120.99920 + 62 * lngDegTrip],
+      [14.55580, 120.99920]
+    ],
+    distance: 375,
+    duration: 295,
+    steps: []
+  };
+  // avoidingPool[1]: completely distinct block 120m away
+  const avoidDistinct1: RawRouteCandidate = {
+    coordinates: [
+      [14.55900, 120.99920],
+      [14.55900, 120.99920 - 120 * lngDegTrip],
+      [14.55580, 120.99920 - 120 * lngDegTrip],
+      [14.55580, 120.99920]
+    ],
+    distance: 580,
+    duration: 450,
+    steps: []
+  };
+
+  const poolIterResult = processRoutePipeline({
+    candidates: [fastestNearDupSource, avoidNearDup0, avoidDistinct1],
+    start: [14.55900, 120.99920],
+    end: [14.55580, 120.99920],
+    zones: [poolZone],
+    isSim: false,
+    simHour: null
+  });
+  assert(
+    poolIterResult.routes.some(r => r.name.startsWith('Avoids caution areas')),
+    'Pipeline iterates past near-duplicate avoidingPool[0] to pick distinct avoiding route'
+  );
+
+  // TEST 37: Destination snap check: 29.9m accepted (with endSnapConnector), 45m rejected
+  const snap29_9Route: RawRouteCandidate = {
+    coordinates: [
+      [14.55915, 120.99920],
+      [14.55565 + 29.9 * latDeg, 120.99920]
+    ],
+    distance: 360,
+    duration: 280,
+    steps: []
+  };
+  const snap45Route: RawRouteCandidate = {
+    coordinates: [
+      [14.55915, 120.99920],
+      [14.55565 + 45 * latDeg, 120.99920]
+    ],
+    distance: 344,
+    duration: 260,
+    steps: []
+  };
+  const snapRes = processRoutePipeline({
+    candidates: [snap29_9Route, snap45Route],
+    start: tripStart,
+    end: tripEnd,
+    zones: [farAwayZone],
+    isSim: false,
+    simHour: null
+  });
+  assert(snapRes.routes.length === 1, 'Destination snap: 45m endpoint candidate rejected while 29.9m accepted');
+  assert(
+    Array.isArray(snapRes.routes[0].endSnapConnector) && snapRes.routes[0].endSnapConnector.length === 2,
+    'Destination snap: accepted 29.9m route attaches endSnapConnector dashed line segment'
+  );
+
+  // TEST 38: sessionTripCache does NOT store on failure, and invalidates when zone location/radius changes
+  clearSessionTripCache();
+  let failCalls = 0;
+  const failingDirectFetch = async () => {
+    failCalls++;
+    return null;
+  };
+  // Use non-demo coords inside Palanan so getDemoTripSavedRoutes does not mask empty response
+  const cacheTestStart: [number, number] = [14.5602, 120.9965];
+  const cacheTestEnd: [number, number] = [14.5545, 120.9965];
+  const failRun1 = await generateSuggestedRoutes(cacheTestStart, cacheTestEnd, [shortZone], false, null, failingDirectFetch);
+  const failRun2 = await generateSuggestedRoutes(cacheTestStart, cacheTestEnd, [shortZone], false, null, failingDirectFetch);
+  assert(failRun1.avoidanceStatus === 'requests_failed' && failCalls === 2, 'sessionTripCache does NOT cache requests_failed results');
+
+  // Verify ORS failure is NOT cached in sessionTripCache either
+  clearSessionTripCache();
+  let orsFailCalls = 0;
+  const countingDirectOnlyFetch = async (url: string) => {
+    orsFailCalls++;
+    const segs = url.split('/foot/')[1]?.split('?')[0]?.split(';') || [];
+    if (segs.length === 2) {
+      return {
+        code: 'Ok',
+        routes: [{ distance: 630, duration: 480, legs: [], geometry: { coordinates: [[120.9965, 14.5602], [120.9965, 14.5545]] } }]
+      };
+    }
+    return null;
+  };
+  const orsFailRun1 = await generateSuggestedRoutes(
+    cacheTestStart,
+    cacheTestEnd,
+    [normalizeDangerZone({ id: 'z-cache-ors', location: { lat: 14.5574, lng: 120.9965 }, radius: 50, active: true, activeTime: 'all_day', crimeCount: 5 })],
+    false,
+    null,
+    countingDirectOnlyFetch,
+    undefined,
+    { orsRawFetchFn: async () => { throw new TypeError('Network failure'); } }
+  );
+  const callsAfterRun1 = orsFailCalls;
+  await generateSuggestedRoutes(
+    cacheTestStart,
+    cacheTestEnd,
+    [normalizeDangerZone({ id: 'z-cache-ors', location: { lat: 14.5574, lng: 120.9965 }, radius: 50, active: true, activeTime: 'all_day', crimeCount: 5 })],
+    false,
+    null,
+    countingDirectOnlyFetch,
+    undefined,
+    { orsRawFetchFn: async () => { throw new TypeError('Network failure'); } }
+  );
+  assert(
+    orsFailRun1.avoidanceStatus === 'service_unreachable' && orsFailCalls > callsAfterRun1,
+    'sessionTripCache does NOT store results when ORS fails / is unreachable'
+  );
+
+  // Verify activeZoneKey changes when zone radius changes
+  clearSessionTripCache();
+  let zoneKeyFetchCount = 0;
+  const okDirectFetch = async () => {
+    zoneKeyFetchCount++;
+    return {
+      code: 'Ok',
+      routes: [{ distance: 630, duration: 480, legs: [], geometry: { coordinates: [[120.9965, 14.5602], [120.9950, 14.5574], [120.9965, 14.5545]] } }]
+    };
+  };
+  const zRadius50 = normalizeDangerZone({ id: 'z-same', location: { lat: 14.5574, lng: 121.0005 }, radius: 50, active: true, activeTime: 'all_day', crimeCount: 3 });
+  const zRadius90 = normalizeDangerZone({ id: 'z-same', location: { lat: 14.5574, lng: 121.0005 }, radius: 90, active: true, activeTime: 'all_day', crimeCount: 3 });
+  await generateSuggestedRoutes(cacheTestStart, cacheTestEnd, [zRadius50], false, null, okDirectFetch);
+  const callsBeforeRadiusChange = zoneKeyFetchCount;
+  await generateSuggestedRoutes(cacheTestStart, cacheTestEnd, [zRadius90], false, null, okDirectFetch);
+  assert(zoneKeyFetchCount > callsBeforeRadiusChange, 'sessionTripCache activeZoneKey includes zone radius and invalidates on change');
+
+  // TEST 39: Route debug flag strictly false in production
+  assert(isMapDebugEnabled({ PROD: true, DEV: false }) === false, 'Route debug line flag is strictly disabled in production (PROD=true)');
+  assert(isMapDebugEnabled({ PROD: true, DEV: true, VITE_MAP_DEBUG: 'true' }) === false, 'PROD=true overrides VITE_MAP_DEBUG=true');
 
   console.log(`\n--- ALL CONSOLIDATED TESTS PASSED: ${passedTests}/${totalTests} ---`);
 }

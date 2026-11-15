@@ -1,7 +1,7 @@
-import { DangerZone, CalculatedRoute, RouteSegment, SafetyLevel, isZoneResolved } from '../types';
+import { DangerZone, CalculatedRoute, RouteSegment, SafetyLevel, AvoidanceStatus, isZoneResolved } from '../types';
 import { isZoneCurrentlyActive, ZONE_COLOR } from './zoneUtils';
 import { isInsidePalanan } from '../lib/palananBounds';
-import { getApiUrl } from '../lib/apiConfig';
+import { getApiUrl, isNativeMissingApiBaseUrl, getCachedApiHealth } from '../lib/apiConfig';
 import palananFixtures from './fixtures/palananTripFixtures.json';
 
 /**
@@ -417,6 +417,7 @@ export interface ProcessPipelineOptions {
   isSim?: boolean;
   simHour?: number | null;
   requestsFailedOrTimedOut?: boolean;
+  serviceUnreachable?: boolean;
   diagnostics?: any;
 }
 
@@ -424,7 +425,7 @@ export interface RouteSuggestionResult {
   routes: CalculatedRoute[];
   warning?: string;
   statusMessage?: string;
-  avoidanceStatus: 'found' | 'no_avoiding_route_found' | 'inside_zone' | 'no_active_zones' | 'requests_failed';
+  avoidanceStatus: AvoidanceStatus;
   rawCandidates?: RawRouteCandidate[];
   diagnostics: {
     serviceCandidatesReturned: number;
@@ -443,6 +444,8 @@ export interface RouteSuggestionResult {
       snappedInside?: boolean;
     }[];
     requestsFailedOrTimedOut?: boolean;
+    orsFailed?: boolean;
+    serviceUnreachable?: boolean;
     totalRequestErrors?: number;
   };
 }
@@ -481,7 +484,16 @@ export function assertRouteInvariants(routes: CalculatedRoute[], fastestRoute: C
  * Used identically on initial route calculation and during simulated clock changes.
  */
 export function processRoutePipeline(options: ProcessPipelineOptions): RouteSuggestionResult {
-  const { candidates, start, end, zones, isSim = false, simHour = null, requestsFailedOrTimedOut = false } = options;
+  const {
+    candidates,
+    start,
+    end,
+    zones,
+    isSim = false,
+    simHour = null,
+    requestsFailedOrTimedOut = false,
+    serviceUnreachable = false
+  } = options;
 
   const diagnostics = options.diagnostics || {
     serviceCandidatesReturned: candidates.filter(c => c.originType !== 'waypoint_detour').length,
@@ -490,7 +502,8 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
     rejectionReasons: { 'crosses an active zone': 0, 'outside bounds': 0, 'duplicate': 0, 'error': 0 },
     finalRoutesCount: 0,
     avoidanceWaypointsTried: [],
-    requestsFailedOrTimedOut
+    requestsFailedOrTimedOut,
+    serviceUnreachable
   };
 
   const activeNowZones = zones.filter(zone => {
@@ -507,6 +520,7 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
   });
 
   // STEP 1 - VERIFY: Recompute verified metrics from actual geometry sampled at most every 10m
+  // and reject candidates whose destination snap exceeds 40m from requested end.
   interface VerifiedCandidate extends RawRouteCandidate {
     safety: SafetyLevel;
     safetyScore: number;
@@ -519,13 +533,24 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
     minClearance: number;
     isClear: boolean;
     baseSummary: string;
+    endErrorMeters: number;
   }
 
-  const verifiedCandidates: VerifiedCandidate[] = candidates.map(c => {
+  const verifiedCandidates: VerifiedCandidate[] = [];
+  for (const c of candidates) {
+    if (!c.coordinates || c.coordinates.length < 2) continue;
+    const lastPt = c.coordinates[c.coordinates.length - 1];
+    const endErrorMeters = getDistanceMeters(lastPt[0], lastPt[1], end[0], end[1]);
+    if (endErrorMeters > 40) {
+      diagnostics.detourCandidatesRejected = (diagnostics.detourCandidatesRejected || 0) + 1;
+      diagnostics.rejectionReasons['end too far (>40m)'] = (diagnostics.rejectionReasons['end too far (>40m)'] || 0) + 1;
+      continue;
+    }
+
     const densified = densifyCoordinates(c.coordinates, 10);
     const metrics = computeRouteZoneMetrics(densified, c.distance, c.duration, zones, isSim, simHour);
     const clearance = isRouteClearingAllZones(densified, zones, 10, isSim, simHour);
-    return {
+    verifiedCandidates.push({
       ...c,
       coordinates: densified,
       safety: metrics.safety,
@@ -538,11 +563,22 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
       passedZonesCount: metrics.passedZonesCount,
       minClearance: clearance.minClearance,
       isClear: clearance.isClear,
-      baseSummary: metrics.summaryText
-    };
-  });
+      baseSummary: metrics.summaryText,
+      endErrorMeters
+    });
+  }
 
   if (verifiedCandidates.length === 0) {
+    if (serviceUnreachable && activeNowZones.length > 0) {
+      return {
+        routes: [],
+        warning: "Safer-route service is not reachable. Showing the fastest route only.",
+        statusMessage: "Safer-route service is not reachable. Showing the fastest route only.",
+        avoidanceStatus: 'service_unreachable',
+        rawCandidates: candidates,
+        diagnostics
+      };
+    }
     return {
       routes: [],
       warning: requestsFailedOrTimedOut
@@ -577,38 +613,58 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
     return a.distance - b.distance;
   });
 
+  // Fastest only "avoids" when it itself has 0m inside AND >= 10m clearance.
+  const fastestAlreadyAvoids = fastest.metersInside === 0 && fastest.minClearance >= 10;
   let bestAvoidingCandidate: VerifiedCandidate | null = null;
-  let fastestAlreadyAvoids = false;
 
-  if (avoidingPool.length > 0) {
-    const topAvoid = avoidingPool[0];
-    if (areRoutesNearDuplicates(topAvoid.coordinates, fastest.coordinates, 30)) {
-      fastestAlreadyAvoids = true;
-    } else {
-      bestAvoidingCandidate = topAvoid;
+  if (!fastestAlreadyAvoids) {
+    for (const cand of avoidingPool) {
+      if (!areRoutesNearDuplicates(cand.coordinates, fastest.coordinates, 30)) {
+        bestAvoidingCandidate = cand;
+        break;
+      }
     }
   }
 
-  // c. If no avoiding route exists: "Least time in caution area"
-  // candidate with smallest metersInside, shown only if metersInside < fastest.metersInside
+  // c. If no avoiding route exists:
+  // First look for a close-pass route (metersInside === 0 with minClearance < 10m) that improves over Fastest;
+  // Never label a 0m-inside candidate as "Least time in caution area".
+  // Otherwise fall back to "Least time in caution area" (strictly 0 < metersInside < fastest.metersInside).
+  let bestClosePassCandidate: VerifiedCandidate | null = null;
   let leastTimeCandidate: VerifiedCandidate | null = null;
+
   if (!bestAvoidingCandidate && !fastestAlreadyAvoids && activeNowZones.length > 0) {
-    const lowerInsideCandidates = verifiedCandidates.filter(c =>
-      c.metersInside < fastest.metersInside &&
-      !areRoutesNearDuplicates(c.coordinates, fastest.coordinates, 30)
+    const closePassPool = verifiedCandidates.filter(c =>
+      c.metersInside === 0 &&
+      c.minClearance < 10 &&
+      !areRoutesNearDuplicates(c.coordinates, fastest.coordinates, 30) &&
+      (fastest.metersInside > 0 || c.minClearance > fastest.minClearance)
     );
-    if (lowerInsideCandidates.length > 0) {
-      lowerInsideCandidates.sort((a, b) => {
-        if (a.metersInside !== b.metersInside) return a.metersInside - b.metersInside;
+    if (closePassPool.length > 0) {
+      closePassPool.sort((a, b) => {
+        if (b.minClearance !== a.minClearance) return b.minClearance - a.minClearance;
         return a.distance - b.distance;
       });
-      leastTimeCandidate = lowerInsideCandidates[0];
+      bestClosePassCandidate = closePassPool[0];
+    } else {
+      const lowerInsideCandidates = verifiedCandidates.filter(c =>
+        c.metersInside > 0 &&
+        c.metersInside < fastest.metersInside &&
+        !areRoutesNearDuplicates(c.coordinates, fastest.coordinates, 30)
+      );
+      if (lowerInsideCandidates.length > 0) {
+        lowerInsideCandidates.sort((a, b) => {
+          if (a.metersInside !== b.metersInside) return a.metersInside - b.metersInside;
+          return a.distance - b.distance;
+        });
+        leastTimeCandidate = lowerInsideCandidates[0];
+      }
     }
   }
 
   // d. Balanced: only a real compromise
-  // longer than Fastest, less metersInside than Fastest, and shorter than Avoids/Least-time
-  const secondChoice = bestAvoidingCandidate || leastTimeCandidate;
+  // longer than Fastest, less metersInside than Fastest, and shorter than Avoids/Close-pass/Least-time
+  const secondChoice = bestAvoidingCandidate || bestClosePassCandidate || leastTimeCandidate;
   const balancedCandidates = verifiedCandidates.filter(c => {
     if (areRoutesNearDuplicates(c.coordinates, fastest.coordinates, 30)) return false;
     if (secondChoice && areRoutesNearDuplicates(c.coordinates, secondChoice.coordinates, 30)) return false;
@@ -631,6 +687,8 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
 
   if (bestAvoidingCandidate) {
     selectedCandidates.push(bestAvoidingCandidate);
+  } else if (bestClosePassCandidate) {
+    selectedCandidates.push(bestClosePassCandidate);
   } else if (leastTimeCandidate) {
     selectedCandidates.push(leastTimeCandidate);
   }
@@ -655,14 +713,18 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
     const diffDist = Math.max(0, Math.round(c.distance - fastestDist));
     const diffDurMin = Math.max(0, Math.round((c.duration - fastestDur) / 60));
     const insideSaved = Math.round(fastestInside - c.metersInside);
+    const edgeMeters = Math.max(0, Math.round(c.minClearance));
 
     let summaryText = c.baseSummary;
 
     if (idx === 0) {
       // Fastest
-      if (fastestAlreadyAvoids || (c.metersInside === 0 && c.minClearance >= 10)) {
+      if (c.metersInside === 0 && c.minClearance >= 10) {
         name = 'Fastest - avoids active caution areas';
         summaryText = 'No active caution area on this route.';
+      } else if (activeNowZones.length > 0 && c.metersInside === 0 && c.minClearance < 10) {
+        name = `Fastest - Passes close to a caution area (${edgeMeters} m from edge)`;
+        summaryText = `Passes close to a caution area (${edgeMeters} m from edge).`;
       } else {
         name = 'Fastest';
       }
@@ -679,8 +741,13 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
 
       const insidePart = insideSaved > 0 ? `, -${insideSaved} m inside compared to fastest` : ' compared to fastest';
       summaryText = `No active caution area on this route. +${diffDist} m / +${diffDurMin} min${insidePart}`;
+    } else if (c === bestClosePassCandidate) {
+      // Close pass (0m inside, < 10m clearance)
+      name = `Passes close to a caution area (${edgeMeters} m from edge)`;
+      const insidePart = insideSaved > 0 ? `, -${insideSaved} m inside compared to fastest` : ' compared to fastest';
+      summaryText = `Passes close to a caution area (${edgeMeters} m from edge). +${diffDist} m / +${diffDurMin} min${insidePart}`;
     } else if (c === leastTimeCandidate) {
-      // Least time in caution area
+      // Least time in caution area (strictly metersInside > 0)
       name = 'Least time in caution area';
       const insidePart = insideSaved > 0 ? `, -${insideSaved} m inside compared to fastest` : ' compared to fastest';
       summaryText = `${c.baseSummary} +${diffDist} m / +${diffDurMin} min${insidePart}`;
@@ -688,8 +755,17 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
       // Balanced
       name = 'Balanced';
       const insidePart = insideSaved > 0 ? `, -${insideSaved} m inside compared to fastest` : ' compared to fastest';
-      summaryText = `${c.baseSummary} +${diffDist} m / +${diffDurMin} min${insidePart}`;
+      if (activeNowZones.length > 0 && c.metersInside === 0 && c.minClearance < 10) {
+        summaryText = `Passes close to a caution area (${edgeMeters} m from edge). +${diffDist} m / +${diffDurMin} min${insidePart}`;
+      } else {
+        summaryText = `${c.baseSummary} +${diffDist} m / +${diffDurMin} min${insidePart}`;
+      }
     }
+
+    const endSnapConnector: [number, number][] | undefined =
+      c.endErrorMeters > 5 && c.endErrorMeters <= 40
+        ? [c.coordinates[c.coordinates.length - 1], end]
+        : undefined;
 
     return {
       id: `route-${idx}`,
@@ -711,15 +787,20 @@ export function processRoutePipeline(options: ProcessPipelineOptions): RouteSugg
       isAvoidanceRoute,
       isOverCap,
       extraDistance,
-      extraDuration
+      extraDuration,
+      endSnapConnector,
+      endErrorMeters: Math.round(c.endErrorMeters * 10) / 10
     };
   });
 
   // MESSAGES: exactly one status message at most, chosen in strict priority order
   let statusMessage: string | undefined = undefined;
-  let avoidanceStatus: RouteSuggestionResult['avoidanceStatus'] = 'found';
+  let avoidanceStatus: AvoidanceStatus = 'found';
 
-  if (requestsFailedOrTimedOut) {
+  if (serviceUnreachable && !bestAvoidingCandidate && !fastestAlreadyAvoids && activeNowZones.length > 0) {
+    statusMessage = "Safer-route service is not reachable. Showing the fastest route only.";
+    avoidanceStatus = 'service_unreachable';
+  } else if (requestsFailedOrTimedOut && !bestAvoidingCandidate && !fastestAlreadyAvoids) {
     statusMessage = "Couldn't finish checking for routes that avoid caution areas. Try again.";
     avoidanceStatus = 'requests_failed';
   } else if (isOriginOrDestInsideOrNearZone) {
@@ -767,6 +848,7 @@ const sessionTripCache = new Map<string, RouteSuggestionResult>();
 
 export function clearSessionTripCache(): void {
   sessionTripCache.clear();
+  waypointGeometryCache.clear();
 }
 
 /**
@@ -835,9 +917,10 @@ export function getDemoTripSavedRoutes(
 /**
  * Main candidate generator:
  * 1. Service direct route first -> display immediately as "Fastest"
- * 2. Background detour search with max 12 detour requests, 16 total requests,
- *    4 concurrent, 8s timeout, stop on first 429 or 2 consecutive failures,
- *    300ms pause between batches of 4, 20s global budget, session cache.
+ * 2. ORS avoid-polygons request (skipped on unconfigured native builds)
+ * 3. Two-via-point fallback detour search with max 12 detour requests, 16 total requests,
+ *    max 2 concurrent, 8s timeout, stop on first 429 or 2 consecutive failures,
+ *    300ms pause between batches of 2, 20s global budget, session cache (never caches failures).
  */
 export async function generateSuggestedRoutes(
   start: [number, number],
@@ -850,7 +933,9 @@ export async function generateSuggestedRoutes(
   options?: {
     forceRetry?: boolean;
     orsFetchFn?: (endpoint: string, body: any, timeoutMs?: number) => Promise<any | null>;
+    orsRawFetchFn?: typeof fetch;
     isCurrentLocation?: boolean;
+    isNative?: boolean;
   }
 ): Promise<RouteSuggestionResult> {
   const diagnostics = {
@@ -866,6 +951,8 @@ export async function generateSuggestedRoutes(
     finalRoutesCount: 0,
     avoidanceWaypointsTried: [] as any[],
     requestsFailedOrTimedOut: false,
+    orsFailed: false,
+    serviceUnreachable: false,
     totalRequestErrors: 0
   };
 
@@ -875,9 +962,9 @@ export async function generateSuggestedRoutes(
     return isZoneCurrentlyActive(zone, isSim, simHour);
   });
 
-  // 1. Session Cache Check
+  // 1. Session Cache Check (includes zone lat, lng, radius, and crimeCount)
   const activeZoneKey = activeNowZones
-    .map(z => `${z.id}:${z.crimeCount || 0}`)
+    .map(z => `${z.id}:${z.location.lat.toFixed(5)},${z.location.lng.toFixed(5)}:${z.radius}:${z.crimeCount || 0}`)
     .sort()
     .join(';');
   const startLatKey = options?.isCurrentLocation
@@ -907,6 +994,8 @@ export async function generateSuggestedRoutes(
   let hit429 = false;
   let consecutiveDetourFailures = 0; // stop after 2 consecutive failures
   let searchStopped = false;
+  let orsFailed = false;
+  let serviceUnreachable = false;
 
   const rawCandidates: RawRouteCandidate[] = [];
 
@@ -1019,7 +1108,6 @@ export async function generateSuggestedRoutes(
     if (isDemoCoords) {
       clearTimeout(budgetTimer);
       const demoRes = getDemoTripSavedRoutes(zones, isSim, simHour);
-      sessionTripCache.set(tripCacheKey, demoRes);
       if (onProgress) onProgress(demoRes);
       return demoRes;
     }
@@ -1035,10 +1123,19 @@ export async function generateSuggestedRoutes(
       zones,
       isSim,
       simHour,
-      requestsFailedOrTimedOut: diagnostics.requestsFailedOrTimedOut || hit429,
+      requestsFailedOrTimedOut: diagnostics.requestsFailedOrTimedOut || hit429 || orsFailed,
+      serviceUnreachable,
       diagnostics
     });
-    if (result.routes.length > 0) {
+    if (
+      result.routes.length > 0 &&
+      !diagnostics.requestsFailedOrTimedOut &&
+      !hit429 &&
+      !orsFailed &&
+      !serviceUnreachable &&
+      result.avoidanceStatus !== 'requests_failed' &&
+      result.avoidanceStatus !== 'service_unreachable'
+    ) {
       sessionTripCache.set(tripCacheKey, result);
     }
     if (onProgress) onProgress(result);
@@ -1046,10 +1143,6 @@ export async function generateSuggestedRoutes(
   }
 
   // 4. OpenRouteService Avoid-Polygons Request (Primary avoiding route finder)
-  // Convert each active zone into a polygon (radius + 10m, 24+ sides).
-  // Origin or destination inside zone: handled as "least time inside" (exclude that zone from avoid_polygons).
-  // At most 1 ORS request per trip plus 1 retry.
-  // Verify returned geometry: metersInside === 0 and clearance >= 10m from every active zone center.
   let foundAvoidingRoute = false;
 
   const activeZonesToAvoid = activeNowZones.filter(z => {
@@ -1059,180 +1152,283 @@ export async function generateSuggestedRoutes(
   });
 
   if (activeZonesToAvoid.length > 0 && !hit429 && totalHttpAttempts < 16 && !globalController.signal.aborted) {
-    const avoidPolygons = activeZonesToAvoid.map(z => [createZoneAvoidPolygon(z, 10, 32)]);
-    const orsBody = {
-      coordinates: [[start[1], start[0]], [end[1], end[0]]],
-      avoidPolygons
-    };
+    const hasCustomOrsFn = Boolean(options?.orsFetchFn || options?.orsRawFetchFn);
+    const nativeMissingUrl = isNativeMissingApiBaseUrl({ isNative: options?.isNative });
+    const cachedHealth = !hasCustomOrsFn ? getCachedApiHealth() : null;
 
-    let orsJson: any = null;
-    let orsAttempts = 0;
-    const maxOrsAttempts = 2; // at most 1 request plus 1 retry
-    let currentStart = [...start] as [number, number];
-    let currentEnd = [...end] as [number, number];
-    let hadError2010 = false;
+    if (nativeMissingUrl && !hasCustomOrsFn) {
+      // Packaged native app with no configured API base URL: skip ORS and mark service unreachable
+      orsFailed = true;
+      serviceUnreachable = true;
+      diagnostics.requestsFailedOrTimedOut = true;
+      diagnostics.orsFailed = true;
+      diagnostics.serviceUnreachable = true;
+      diagnostics.totalRequestErrors++;
+    } else if (!options?.forceRetry && cachedHealth && !cachedHealth.ok && !hasCustomOrsFn) {
+      orsFailed = true;
+      serviceUnreachable = true;
+      diagnostics.requestsFailedOrTimedOut = true;
+      diagnostics.orsFailed = true;
+      diagnostics.serviceUnreachable = true;
+      diagnostics.totalRequestErrors++;
+    } else if (hasCustomOrsFn || typeof window !== 'undefined') {
+      const avoidPolygons = activeZonesToAvoid.map(z => [createZoneAvoidPolygon(z, 10, 32)]);
 
-    while (orsAttempts < maxOrsAttempts && !orsJson && totalHttpAttempts < 16 && !globalController.signal.aborted && !hit429) {
-      orsAttempts++;
-      totalHttpAttempts++;
-      const currentOrsBody = {
-        coordinates: [[currentStart[1], currentStart[0]], [currentEnd[1], currentEnd[0]]],
-        avoidPolygons
-      };
+      let orsJson: any = null;
+      let orsAttempts = 0;
+      const maxOrsAttempts = 2; // at most 1 request plus 1 retry
+      let currentStart = [...start] as [number, number];
+      let currentEnd = [...end] as [number, number];
 
-      try {
-        let resData: any = null;
-        let resStatus = 200;
+      while (orsAttempts < maxOrsAttempts && !orsJson && totalHttpAttempts < 16 && !globalController.signal.aborted && !hit429) {
+        orsAttempts++;
+        totalHttpAttempts++;
+        const currentOrsBody = {
+          coordinates: [[currentStart[1], currentStart[0]], [currentEnd[1], currentEnd[0]]],
+          avoidPolygons
+        };
 
-        if (options?.orsFetchFn) {
-          const res = await options.orsFetchFn('/api/directions/ors', currentOrsBody, 8000);
-          if (res) {
+        try {
+          let resData: any = null;
+          let resStatus = 200;
+
+          if (options?.orsFetchFn) {
+            const res = await options.orsFetchFn('/api/directions/ors', currentOrsBody, 8000);
+            if (!res) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
+            if (res.redirected || res.type === 'opaqueredirect' || (res.status >= 300 && res.status < 400) || (typeof res.url === 'string' && res.url.includes('__cookie_check'))) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
+            if (res.isHtml) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
             resStatus = res.status || (res.features || res.routes ? 200 : 400);
             resData = res;
-          }
-        } else if (typeof window !== 'undefined') {
-          const controller = new AbortController();
-          const t = setTimeout(() => controller.abort(), 8000);
-          const onAbort = () => controller.abort();
-          globalController.signal.addEventListener('abort', onAbort, { once: true });
+          } else if (options?.orsRawFetchFn || typeof window !== 'undefined') {
+            const rawFetch = options?.orsRawFetchFn || fetch;
+            const controller = new AbortController();
+            const t = setTimeout(() => controller.abort(), 8000);
+            const onAbort = () => controller.abort();
+            globalController.signal.addEventListener('abort', onAbort, { once: true });
 
-          const res = await fetch(getApiUrl('/api/directions/ors'), {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(currentOrsBody),
-            signal: controller.signal
-          });
-          clearTimeout(t);
-          globalController.signal.removeEventListener('abort', onAbort);
-
-          resStatus = res.status;
-          try {
-            resData = await res.json();
-          } catch {}
-        }
-
-        if (resStatus === 429) {
-          hit429 = true;
-          break;
-        }
-        if (resStatus === 503 || resData?.disabled) {
-          // OPENROUTESERVICE_KEY not configured: skip ORS silently
-          break;
-        }
-
-        if (resData && (resData.features || resData.routes)) {
-          orsJson = resData;
-          break;
-        }
-
-        // Handle ORS error 2010: point cannot be snapped, or lies inside the avoid polygon
-        const errorCode = resData?.code || resData?.orsError?.code;
-        const errorMessage = resData?.error || resData?.orsError?.message || '';
-        const is2010 = errorCode === 2010 || (typeof errorMessage === 'string' && (errorMessage.includes('2010') || errorMessage.includes('routable point')));
-
-        if (is2010) {
-          hadError2010 = true;
-          if (orsAttempts < maxOrsAttempts) {
-            // Retry once with origin and destination moved to the nearest point outside the polygon (about +15m beyond buffer)
-            let moved = false;
-            for (const z of activeZonesToAvoid) {
-              const dS = getDistanceMeters(currentStart[0], currentStart[1], z.location.lat, z.location.lng);
-              if (dS <= z.radius + 15) {
-                const targetD = z.radius + 25; // +15m outside the polygon (radius + 10m buffer)
-                const ratio = dS > 0.1 ? targetD / dS : 1;
-                currentStart = [
-                  z.location.lat + (currentStart[0] - z.location.lat) * ratio,
-                  z.location.lng + (currentStart[1] - z.location.lng) * ratio
-                ];
-                moved = true;
-              }
-              const dE = getDistanceMeters(currentEnd[0], currentEnd[1], z.location.lat, z.location.lng);
-              if (dE <= z.radius + 15) {
-                const targetD = z.radius + 25;
-                const ratio = dE > 0.1 ? targetD / dE : 1;
-                currentEnd = [
-                  z.location.lat + (currentEnd[0] - z.location.lat) * ratio,
-                  z.location.lng + (currentEnd[1] - z.location.lng) * ratio
-                ];
-                moved = true;
-              }
-            }
-            if (moved) {
-              continue; // Retry once with moved coordinates
-            }
-          }
-          break;
-        }
-      } catch {
-        // Network / abort / timeout error - while loop will attempt at most 1 retry
-      }
-    }
-
-    if (orsJson) {
-      const feature = orsJson.features?.[0];
-      const orsRoute = orsJson.routes?.[0];
-      let coordinates: [number, number][] = [];
-      let distance = 0;
-      let duration = 0;
-      let steps: any[] = [];
-
-      if (feature && feature.geometry && Array.isArray(feature.geometry.coordinates)) {
-        coordinates = feature.geometry.coordinates.map((c: any) => [c[1], c[0]]);
-        distance = feature.properties?.summary?.distance || feature.properties?.segments?.[0]?.distance || 0;
-        duration = feature.properties?.summary?.duration || feature.properties?.segments?.[0]?.duration || 0;
-        steps = feature.properties?.segments?.flatMap((s: any) => s.steps || [])?.map((step: any) => ({
-          instruction: step.instruction || 'Continue ahead',
-          distance: step.distance || 0,
-          name: step.name || 'Street Path'
-        })) || [];
-      } else if (orsRoute && orsRoute.geometry && Array.isArray(orsRoute.geometry.coordinates)) {
-        coordinates = orsRoute.geometry.coordinates.map((c: any) => [c[1], c[0]]);
-        distance = orsRoute.distance || 0;
-        duration = orsRoute.duration || 0;
-        steps = orsRoute.legs?.flatMap((l: any) => l.steps || [])?.map((step: any) => ({
-          instruction: step.maneuver?.instruction || step.instruction || 'Continue ahead',
-          distance: step.distance || 0,
-          name: step.name || 'Street Path'
-        })) || [];
-      }
-
-      if (coordinates.length >= 2) {
-        const densifiedOrs = densifyCoordinates(coordinates, 10);
-        // Requirement 3: VERIFICATION (metersInside = 0 and clearance >= 10m from every active zone center)
-        const clr = isRouteClearingAllZones(densifiedOrs, zones, 10, isSim, simHour);
-        const metrics = computeRouteZoneMetrics(densifiedOrs, distance, duration, zones, isSim, simHour);
-
-        if (metrics.metersInside === 0 && clr.isClear && clr.minClearance >= 10) {
-          rawCandidates.push({
-            coordinates: densifiedOrs,
-            distance,
-            duration,
-            steps,
-            originType: 'ors_avoid'
-          });
-          foundAvoidingRoute = true;
-          searchStopped = true;
-
-          // Progressive emit with verified avoiding route immediately!
-          if (onProgress) {
-            const progressiveResult = processRoutePipeline({
-              candidates: rawCandidates,
-              start,
-              end,
-              zones,
-              isSim,
-              simHour,
-              diagnostics
+            const res = await rawFetch(getApiUrl('/api/directions/ors', { isNative: options?.isNative }), {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(currentOrsBody),
+              redirect: 'manual',
+              signal: controller.signal
             });
-            onProgress(progressiveResult);
+            clearTimeout(t);
+            globalController.signal.removeEventListener('abort', onAbort);
+
+            if (
+              res.type === 'opaqueredirect' ||
+              (res.status >= 300 && res.status < 400) ||
+              res.redirected ||
+              (typeof res.url === 'string' && res.url.includes('__cookie_check'))
+            ) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
+
+            resStatus = res.status;
+
+            if (resStatus === 401 || resStatus === 403) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
+
+            if (resStatus === 429) {
+              hit429 = true;
+              orsFailed = true;
+              break;
+            }
+
+            const contentType = res.headers?.get?.('content-type') || '';
+            const rawText = typeof res.text === 'function'
+              ? await res.text()
+              : JSON.stringify(await res.json());
+            const trimmed = (rawText || '').trim();
+            const looksLikeHtml = trimmed.startsWith('<') || contentType.toLowerCase().includes('text/html');
+
+            if (looksLikeHtml || (res.ok && contentType && !contentType.toLowerCase().includes('json'))) {
+              orsFailed = true;
+              serviceUnreachable = true;
+              break;
+            }
+
+            if (trimmed) {
+              try {
+                resData = JSON.parse(trimmed);
+              } catch {
+                orsFailed = true;
+                serviceUnreachable = true;
+                break;
+              }
+            } else if (resStatus >= 500 || !res.ok) {
+              orsFailed = true;
+              serviceUnreachable = resStatus >= 500;
+              break;
+            }
+          }
+
+          if (resStatus === 429) {
+            hit429 = true;
+            orsFailed = true;
+            break;
+          }
+          if (resStatus === 401 || resStatus === 403) {
+            orsFailed = true;
+            serviceUnreachable = true;
+            break;
+          }
+          if (resStatus >= 500 || resData?.disabled) {
+            orsFailed = true;
+            break;
+          }
+
+          if (resData && (resData.features || resData.routes)) {
+            orsFailed = false;
+            orsJson = resData;
+            break;
+          }
+
+          // Handle ORS error 2010: point cannot be snapped, or lies inside the avoid polygon
+          const errorCode = resData?.code || resData?.orsError?.code;
+          const errorMessage = resData?.error || resData?.orsError?.message || '';
+          const is2010 = errorCode === 2010 || (typeof errorMessage === 'string' && (errorMessage.includes('2010') || errorMessage.includes('routable point')));
+
+          if (is2010) {
+            if (orsAttempts < maxOrsAttempts) {
+              let moved = false;
+              for (const z of activeZonesToAvoid) {
+                const dS = getDistanceMeters(currentStart[0], currentStart[1], z.location.lat, z.location.lng);
+                if (dS <= z.radius + 15) {
+                  const targetD = z.radius + 25;
+                  const ratio = dS > 0.1 ? targetD / dS : 1;
+                  currentStart = [
+                    z.location.lat + (currentStart[0] - z.location.lat) * ratio,
+                    z.location.lng + (currentStart[1] - z.location.lng) * ratio
+                  ];
+                  moved = true;
+                }
+                const dE = getDistanceMeters(currentEnd[0], currentEnd[1], z.location.lat, z.location.lng);
+                if (dE <= z.radius + 15) {
+                  const targetD = z.radius + 25;
+                  const ratio = dE > 0.1 ? targetD / dE : 1;
+                  currentEnd = [
+                    z.location.lat + (currentEnd[0] - z.location.lat) * ratio,
+                    z.location.lng + (currentEnd[1] - z.location.lng) * ratio
+                  ];
+                  moved = true;
+                }
+              }
+              if (moved) {
+                continue;
+              }
+            }
+            break;
+          }
+
+          // Any other non-2010 HTTP error (400/404/etc.) or malformed payload counts as ORS failure
+          if (resStatus >= 400 || !resData) {
+            orsFailed = true;
+            break;
+          }
+        } catch (err: any) {
+          orsFailed = true;
+          if (err instanceof TypeError || err?.name === 'TypeError') {
+            serviceUnreachable = true;
+          }
+          // AbortError (timeout) or TypeError (CORS / network) - loop may attempt 1 retry
+        }
+      }
+
+      if (orsFailed) {
+        diagnostics.requestsFailedOrTimedOut = true;
+        diagnostics.orsFailed = true;
+        diagnostics.serviceUnreachable = serviceUnreachable;
+        diagnostics.totalRequestErrors++;
+      }
+
+      if (orsJson) {
+        const feature = orsJson.features?.[0];
+        const orsRoute = orsJson.routes?.[0];
+        let coordinates: [number, number][] = [];
+        let distance = 0;
+        let duration = 0;
+        let steps: any[] = [];
+
+        if (feature && feature.geometry && Array.isArray(feature.geometry.coordinates)) {
+          coordinates = feature.geometry.coordinates.map((c: any) => [c[1], c[0]]);
+          distance = feature.properties?.summary?.distance || feature.properties?.segments?.[0]?.distance || 0;
+          duration = feature.properties?.summary?.duration || feature.properties?.segments?.[0]?.duration || 0;
+          steps = feature.properties?.segments?.flatMap((s: any) => s.steps || [])?.map((step: any) => ({
+            instruction: step.instruction || 'Continue ahead',
+            distance: step.distance || 0,
+            name: step.name || 'Street Path'
+          })) || [];
+        } else if (orsRoute && orsRoute.geometry && Array.isArray(orsRoute.geometry.coordinates)) {
+          coordinates = orsRoute.geometry.coordinates.map((c: any) => [c[1], c[0]]);
+          distance = orsRoute.distance || 0;
+          duration = orsRoute.duration || 0;
+          steps = orsRoute.legs?.flatMap((l: any) => l.steps || [])?.map((step: any) => ({
+            instruction: step.maneuver?.instruction || step.instruction || 'Continue ahead',
+            distance: step.distance || 0,
+            name: step.name || 'Street Path'
+          })) || [];
+        }
+
+        if (coordinates.length >= 2) {
+          const densifiedOrs = densifyCoordinates(coordinates, 10);
+          const clr = isRouteClearingAllZones(densifiedOrs, zones, 10, isSim, simHour);
+          const metrics = computeRouteZoneMetrics(densifiedOrs, distance, duration, zones, isSim, simHour);
+          const endPt = densifiedOrs[densifiedOrs.length - 1];
+          const endErr = getDistanceMeters(endPt[0], endPt[1], end[0], end[1]);
+
+          if (metrics.metersInside === 0 && clr.isClear && clr.minClearance >= 10 && endErr <= 40) {
+            rawCandidates.push({
+              coordinates: densifiedOrs,
+              distance,
+              duration,
+              steps,
+              originType: 'ors_avoid'
+            });
+            foundAvoidingRoute = true;
+            searchStopped = true;
+
+            if (onProgress) {
+              const progressiveResult = processRoutePipeline({
+                candidates: rawCandidates,
+                start,
+                end,
+                zones,
+                isSim,
+                simHour,
+                requestsFailedOrTimedOut: diagnostics.requestsFailedOrTimedOut || orsFailed,
+                serviceUnreachable,
+                diagnostics
+              });
+              onProgress(progressiveResult);
+            }
           }
         }
       }
     }
   }
 
-  // 5. Fallback detour search around active zones within 1.5x radius
-  // Used if ORS is disabled, fails, is rate-limited, or returns route failing verification.
+  // 5. Fallback two-via-point detour search around active zones within 1.5x radius
+  // Places before & after via-points on the same side (nearest cross streets outside the zone)
+  // across offsets [r + 40, r + 80, r + 120] on both sides.
   const zonesToAvoid = activeNowZones.filter(z => {
     const d = getMinDistanceToSegmentMeters(start[0], start[1], end[0], end[1], z.location.lat, z.location.lng);
     return d <= z.radius * 1.5;
@@ -1241,41 +1437,59 @@ export async function generateSuggestedRoutes(
   const waypointQueue: {
     side: string;
     offset: number;
-    wp: [number, number];
+    wps: [number, number][];
     key: string;
   }[] = [];
 
-  const dLat = end[0] - start[0];
-  const dLng = end[1] - start[1];
-  const len = Math.hypot(dLat, dLng) || 1;
-  const normLat = -dLng / len;
-  const normLng = dLat / len;
-  const tanLat = dLat / len;
-  const tanLng = dLng / len;
+  const midLat = (start[0] + end[0]) / 2;
+  const tripCosLat = Math.cos((midLat * Math.PI) / 180);
+  const dxMeters = (end[1] - start[1]) * 111000 * tripCosLat;
+  const dyMeters = (end[0] - start[0]) * 111000;
+  const tripLenMeters = Math.hypot(dxMeters, dyMeters) || 1;
+  const tanX = dxMeters / tripLenMeters;
+  const tanY = dyMeters / tripLenMeters;
+  const normX = -tanY;
+  const normY = tanX;
 
   const latDeg = 1 / 111000;
 
-  // Search efficiently: most promising offsets first (radius + 40, + 80, + 120)
+  // Offsets [r+40, r+80, r+120] on both sides with paired (before, after) via-points
   if (!foundAvoidingRoute) {
     zonesToAvoid.forEach(zone => {
-      const lngDeg = 1 / (111000 * Math.cos((zone.location.lat * Math.PI) / 180));
+      const cosLat = Math.cos((zone.location.lat * Math.PI) / 180);
+      const lngDeg = 1 / (111000 * cosLat);
       const offsets = [zone.radius + 40, zone.radius + 80, zone.radius + 120];
 
-      offsets.forEach(offset => {
-        const wpLeft: [number, number] = [zone.location.lat + normLat * offset * latDeg, zone.location.lng + normLng * offset * lngDeg];
-        const wpRight: [number, number] = [zone.location.lat - normLat * offset * latDeg, zone.location.lng - normLng * offset * lngDeg];
-        const wpBefore: [number, number] = [zone.location.lat - tanLat * offset * latDeg, zone.location.lng - tanLng * offset * lngDeg];
-        const wpAfter: [number, number] = [zone.location.lat + tanLat * offset * latDeg, zone.location.lng + tanLng * offset * lngDeg];
+      // Longitudinal bracket distance before and after zone center
+      const sToZ_x = (zone.location.lng - start[1]) * 111000 * cosLat;
+      const sToZ_y = (zone.location.lat - start[0]) * 111000;
+      const projAlong = sToZ_x * tanX + sToZ_y * tanY;
+      const distBefore = Math.max(0, projAlong);
+      const distAfter = Math.max(0, tripLenMeters - projAlong);
+      const beforeAlong = distBefore > zone.radius + 35
+        ? zone.radius + 25
+        : Math.max(30, Math.min(zone.radius + 20, distBefore * 0.85 || zone.radius * 0.75));
+      const afterAlong = distAfter > zone.radius + 35
+        ? zone.radius + 25
+        : Math.max(30, Math.min(zone.radius + 20, distAfter * 0.85 || zone.radius * 0.75));
 
+      offsets.forEach(offset => {
         [
-          { side: 'Beside Left', offset, wp: wpLeft },
-          { side: 'Beside Right', offset, wp: wpRight },
-          { side: 'Approach Before', offset, wp: wpBefore },
-          { side: 'Departure After', offset, wp: wpAfter }
-        ].forEach(item => {
-          if (isInsidePalanan(item.wp[0], item.wp[1])) {
-            const key = `${start[0].toFixed(5)},${start[1].toFixed(5)}_${item.wp[0].toFixed(5)},${item.wp[1].toFixed(5)}_${end[0].toFixed(5)},${end[1].toFixed(5)}`;
-            waypointQueue.push({ ...item, key });
+          { side: 'Beside Left', sign: 1 },
+          { side: 'Beside Right', sign: -1 }
+        ].forEach(({ side, sign }) => {
+          const wpBefore: [number, number] = [
+            zone.location.lat + (normY * sign * offset - tanY * beforeAlong) * latDeg,
+            zone.location.lng + (normX * sign * offset - tanX * beforeAlong) * lngDeg
+          ];
+          const wpAfter: [number, number] = [
+            zone.location.lat + (normY * sign * offset + tanY * afterAlong) * latDeg,
+            zone.location.lng + (normX * sign * offset + tanX * afterAlong) * lngDeg
+          ];
+
+          if (isInsidePalanan(wpBefore[0], wpBefore[1]) && isInsidePalanan(wpAfter[0], wpAfter[1])) {
+            const key = `${start[0].toFixed(5)},${start[1].toFixed(5)}_${wpBefore[0].toFixed(5)},${wpBefore[1].toFixed(5)}_${wpAfter[0].toFixed(5)},${wpAfter[1].toFixed(5)}_${end[0].toFixed(5)},${end[1].toFixed(5)}`;
+            waypointQueue.push({ side, offset, wps: [wpBefore, wpAfter], key });
           } else {
             diagnostics.rejectionReasons['outside bounds']++;
           }
@@ -1289,24 +1503,30 @@ export async function generateSuggestedRoutes(
       const z2 = zonesToAvoid[1];
       const off1 = z1.radius + 60;
       const off2 = z2.radius + 60;
-      const wp1: [number, number] = [z1.location.lat + normLat * off1 * latDeg, z1.location.lng + normLng * off1 * (1 / (111000 * Math.cos(z1.location.lat * Math.PI / 180)))];
-      const wp2: [number, number] = [z2.location.lat + normLat * off2 * latDeg, z2.location.lng + normLng * off2 * (1 / (111000 * Math.cos(z2.location.lat * Math.PI / 180)))];
+      const wp1: [number, number] = [
+        z1.location.lat + normY * off1 * latDeg,
+        z1.location.lng + normX * off1 * (1 / (111000 * Math.cos((z1.location.lat * Math.PI) / 180)))
+      ];
+      const wp2: [number, number] = [
+        z2.location.lat + normY * off2 * latDeg,
+        z2.location.lng + normX * off2 * (1 / (111000 * Math.cos((z2.location.lat * Math.PI) / 180)))
+      ];
       if (isInsidePalanan(wp1[0], wp1[1]) && isInsidePalanan(wp2[0], wp2[1])) {
         const chainedKey = `chained_${start[0].toFixed(4)}_${wp1[0].toFixed(4)}_${wp2[0].toFixed(4)}_${end[0].toFixed(4)}`;
-        waypointQueue.push({ side: 'Chained Dual Zone', offset: off1, wp: wp1, key: chainedKey });
+        waypointQueue.push({ side: 'Chained Dual Zone', offset: off1, wps: [wp1, wp2], key: chainedKey });
       }
     }
   }
 
-  // 6. Worker loop with batching (max 4 concurrent), 300ms pause, cap of 12 detour attempts
+  // 6. Worker loop with max 2 concurrent requests, 300ms pause between batches, cap of 12 detour attempts / 16 total
   let extraOffsetsLeft = 4;
 
-  for (let i = 0; i < waypointQueue.length && !searchStopped; i += 4) {
+  for (let i = 0; i < waypointQueue.length && !searchStopped; i += 2) {
     if (globalController.signal.aborted || hit429 || consecutiveDetourFailures >= 2 || detourHttpAttempts >= 12 || totalHttpAttempts >= 16) {
       break;
     }
 
-    const batch = waypointQueue.slice(i, i + 4);
+    const batch = waypointQueue.slice(i, i + 2);
     const batchPromises = batch.map(async item => {
       if (searchStopped || hit429 || consecutiveDetourFailures >= 2 || detourHttpAttempts >= 12 || totalHttpAttempts >= 16 || globalController.signal.aborted) {
         return;
@@ -1326,11 +1546,17 @@ export async function generateSuggestedRoutes(
           waypointKey: item.key
         });
         const clr = isRouteClearingAllZones(cached.coordinates, zones, 10, isSim, simHour);
-        if (clr.isClear) foundAvoidingRoute = true;
+        const lastPt = cached.coordinates[cached.coordinates.length - 1];
+        const endErr = getDistanceMeters(lastPt[0], lastPt[1], end[0], end[1]);
+        if (clr.isClear && endErr <= 40) foundAvoidingRoute = true;
         return;
       }
 
-      const coordsStr = `${start[1]},${start[0]};${item.wp[1]},${item.wp[0]};${end[1]},${end[0]}`;
+      const coordsStr = [
+        `${start[1]},${start[0]}`,
+        ...item.wps.map(wp => `${wp[1]},${wp[0]}`),
+        `${end[1]},${end[0]}`
+      ].join(';');
       let json: any = null;
 
       if (fetchFn) {
@@ -1426,28 +1652,50 @@ export async function generateSuggestedRoutes(
           name: step.name || 'Street Path'
         })) || [];
 
-        waypointGeometryCache.set(item.key, {
-          coordinates,
-          distance: r.distance,
-          duration: r.duration,
-          steps
+        const densified = densifyCoordinates(coordinates, 10);
+        const clr = isRouteClearingAllZones(densified, zones, 10, isSim, simHour);
+        const metrics = computeRouteZoneMetrics(densified, r.distance, r.duration, zones, isSim, simHour);
+        const lastPt = coordinates[coordinates.length - 1];
+        const endErr = lastPt ? getDistanceMeters(lastPt[0], lastPt[1], end[0], end[1]) : Infinity;
+
+        diagnostics.avoidanceWaypointsTried.push({
+          side: item.side,
+          offset: item.offset,
+          routeDistance: Math.round(r.distance),
+          metersInside: metrics.metersInside,
+          metersBuffer: metrics.metersBuffer,
+          minClearance: Math.round(clr.minClearance),
+          status: endErr > 40 ? 'end_too_far' : (clr.isClear && metrics.metersInside === 0 ? 'verified_clear' : (metrics.metersInside > 0 ? 'crosses_zone' : 'close_pass'))
         });
 
-        rawCandidates.push({
-          coordinates,
-          distance: r.distance,
-          duration: r.duration,
-          steps,
-          originType: 'waypoint_detour',
-          waypointKey: item.key
-        });
+        if (endErr <= 40) {
+          waypointGeometryCache.set(item.key, {
+            coordinates,
+            distance: r.distance,
+            duration: r.duration,
+            steps
+          });
 
-        const clr = isRouteClearingAllZones(coordinates, zones, 10, isSim, simHour);
-        if (clr.isClear) {
-          foundAvoidingRoute = true;
+          rawCandidates.push({
+            coordinates,
+            distance: r.distance,
+            duration: r.duration,
+            steps,
+            originType: 'waypoint_detour',
+            waypointKey: item.key
+          });
+
+          if (clr.isClear && metrics.metersInside === 0) {
+            foundAvoidingRoute = true;
+          }
         }
       } else {
         diagnostics.rejectionReasons['error']++;
+        diagnostics.avoidanceWaypointsTried.push({
+          side: item.side,
+          offset: item.offset,
+          status: 'request_failed'
+        });
       }
     });
 
@@ -1462,6 +1710,8 @@ export async function generateSuggestedRoutes(
         zones,
         isSim,
         simHour,
+        requestsFailedOrTimedOut: diagnostics.requestsFailedOrTimedOut || orsFailed,
+        serviceUnreachable,
         diagnostics
       });
       onProgress(progressiveResult);
@@ -1477,15 +1727,20 @@ export async function generateSuggestedRoutes(
 
     if (searchStopped) break;
 
-    // 300 ms pause between batches of 4
-    if (i + 4 < waypointQueue.length) {
+    // 300 ms pause between batches of 2
+    if (i + 2 < waypointQueue.length) {
       await new Promise(r => setTimeout(r, 300));
     }
   }
 
   clearTimeout(budgetTimer);
 
-  // 6. Final pipeline consolidation
+  // 7. Final pipeline consolidation
+  const anyFailure = Boolean(diagnostics.requestsFailedOrTimedOut || hit429 || consecutiveDetourFailures >= 2 || orsFailed);
+  diagnostics.requestsFailedOrTimedOut = anyFailure;
+  diagnostics.orsFailed = orsFailed;
+  diagnostics.serviceUnreachable = serviceUnreachable;
+
   const finalResult = processRoutePipeline({
     candidates: rawCandidates,
     start,
@@ -1493,11 +1748,19 @@ export async function generateSuggestedRoutes(
     zones,
     isSim,
     simHour,
-    requestsFailedOrTimedOut: diagnostics.requestsFailedOrTimedOut || hit429 || consecutiveDetourFailures >= 2,
+    requestsFailedOrTimedOut: anyFailure,
+    serviceUnreachable,
     diagnostics
   });
 
-  if (finalResult.routes.length > 0) {
+  if (
+    finalResult.routes.length > 0 &&
+    !anyFailure &&
+    !orsFailed &&
+    !serviceUnreachable &&
+    finalResult.avoidanceStatus !== 'requests_failed' &&
+    finalResult.avoidanceStatus !== 'service_unreachable'
+  ) {
     sessionTripCache.set(tripCacheKey, finalResult);
   }
 

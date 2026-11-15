@@ -16,7 +16,7 @@ export type GpsStartSuccess = {
 
 export type GpsStartFailure = {
   success: false;
-  reason: 'denied' | 'off' | 'outside_palanan' | 'timeout' | 'weak' | 'searching' | 'no_fix';
+  reason: 'denied' | 'off' | 'lost' | 'outside_palanan' | 'timeout' | 'weak' | 'searching' | 'no_fix';
   message: string;
   canOpenSettings?: boolean;
   offerPickOnMap: boolean;
@@ -37,10 +37,47 @@ export interface GetRouteStartOptions {
 }
 
 /**
+ * Determines whether a fresh GPS fix after calculating a route from "My location"
+ * should offer the "Recalculate from here" action (> 40 m shift).
+ */
+export function shouldOfferRecalculateForImprovedFix(params: {
+  routeCalculated: boolean;
+  isStartLinkedToGps: boolean;
+  isSimulating: boolean;
+  routeStart: [number, number] | null;
+  livePosition: [number, number] | null;
+  status: LocationState['status'];
+  isStale: boolean;
+  accuracy: number | null;
+  distanceFn: (lat1: number, lng1: number, lat2: number, lng2: number) => number;
+}): boolean {
+  const {
+    routeCalculated,
+    isStartLinkedToGps,
+    isSimulating,
+    routeStart,
+    livePosition,
+    status,
+    isStale,
+    accuracy,
+    distanceFn,
+  } = params;
+
+  if (!routeCalculated || !isStartLinkedToGps || isSimulating) return false;
+  if (!routeStart || !livePosition) return false;
+  if (isStale || status === 'lost' || status === 'denied' || status === 'off') return false;
+  if (accuracy !== null && accuracy > 100) return false;
+
+  const movedMeters = distanceFn(livePosition[0], livePosition[1], routeStart[0], routeStart[1]);
+  return movedMeters > 40;
+}
+
+/**
  * Single source of truth helper for current-location routing.
  * Reads position, accuracy, and status from locationTracker (the same source as the blue dot & simulator).
  *
  * Rules:
+ * - status === 'lost' or isStale === true: block routing and offer "Pick start on map".
  * - accuracy 50 m or better: use it.
  * - 50 to 100 m: use it and show "Using approximate location (±N m)".
  * - worse than 100 m or no fix: show "Waiting for a better GPS signal..." for up to 10 s, then offer "Pick start on map".
@@ -98,7 +135,17 @@ export async function getRouteStartFromGps(options: GetRouteStartOptions = {}): 
       };
     }
 
-    // 4. Have a position fix
+    // 4. Lost or stale GPS fix: not valid for routing
+    if (state.status === 'lost' || state.isStale === true) {
+      return {
+        success: false,
+        reason: 'lost',
+        message: 'GPS signal lost. Pick start on map or wait for a fix.',
+        offerPickOnMap: true,
+      };
+    }
+
+    // 5. Have a fresh position fix
     if (state.position) {
       const lat = state.position[0];
       const lng = state.position[1];
