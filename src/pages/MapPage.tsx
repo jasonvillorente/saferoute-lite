@@ -8,6 +8,7 @@ import { useAuth } from '../context/AuthContext';
 import { 
   Report, 
   DangerZone, 
+  ZoneDangerLevel,
   SavedPlace, 
   PlaceCategory, 
   safeGetCoords, 
@@ -32,14 +33,17 @@ import { ResilientTileLayer } from '../components/ResilientTileLayer';
 import { isMapDebugEnabled } from '../config/debugFlags';
 import { 
   normalizeDangerZone, 
+  normalizeZoneDangerLevel,
   isZoneActiveNow, 
   isZoneCurrentlyActive,
   getSourceLabel, 
   formatActiveTimeWindow, 
   formatIncidentCountText, 
   getZoneMapStyles, 
-  escapeHtml,
-  ZONE_COLOR
+  getZoneLevelStyle,
+  getZoneLevelPriority,
+  ZONE_LEVEL_STYLES,
+  escapeHtml
 } from '../utils/zoneUtils';
 import {
   generateSuggestedRoutes,
@@ -346,12 +350,14 @@ function MapViewController({
   liveCoords, 
   autoFollow, 
   onMapInstance,
-  onUserDrag
+  onUserDrag,
+  onBoundsChange
 }: { 
   liveCoords: [number, number] | null; 
   autoFollow: boolean;
   onMapInstance: (map: L.Map) => void;
   onUserDrag: () => void;
+  onBoundsChange?: (bounds: L.LatLngBounds) => void;
 }) {
   const map = useMap();
   const hasCenteredInitially = useRef(false);
@@ -359,12 +365,21 @@ function MapViewController({
   useEffect(() => {
     if (map) {
       onMapInstance(map);
+      if (onBoundsChange) {
+        onBoundsChange(map.getBounds());
+      }
     }
-  }, [map, onMapInstance]);
+  }, [map, onMapInstance, onBoundsChange]);
 
   useMapEvents({
     dragstart() {
       onUserDrag();
+    },
+    moveend() {
+      if (map && onBoundsChange) onBoundsChange(map.getBounds());
+    },
+    zoomend() {
+      if (map && onBoundsChange) onBoundsChange(map.getBounds());
     }
   });
 
@@ -557,10 +572,12 @@ export default function MapPage() {
     zoneTitle: string;
     category: string;
     incidentText: string;
+    dangerLevel?: ZoneDangerLevel;
   }
   const [activeZoneAlert, setActiveZoneAlert] = useState<ActiveZoneAlert | null>(null);
   const [dismissedZoneId, setDismissedZoneId] = useState<string | null>(null);
   const enteredZoneIdRef = useRef<string | null>(null);
+  const [mapBounds, setMapBounds] = useState<L.LatLngBounds | null>(null);
 
   // Simulated navigation movement
   const [isSimulating, setIsSimulating] = useState(false);
@@ -589,7 +606,7 @@ export default function MapPage() {
     return computeRouteZoneMetrics(coordinates, distance, distance / 1.3, zones, isSim, simHour);
   };
 
-  // Get danger zone rendering properties based strictly on active time status (Single Color Rule)
+  // Get danger zone rendering properties based on barangay-assigned dangerLevel and active time status
   // Feeds simulated clock strictly during simulation; real Manila time otherwise
   const getDangerZoneSpecs = (zone: DangerZone) => {
     const isNow = isZoneCurrentlyActive(zone, isSimulating, simulatedHour);
@@ -600,9 +617,13 @@ export default function MapPage() {
       : (zone.activeTime === 'night_only' ? 'Caution at night only (Inactive right now)' : 'Inactive right now');
 
     return {
-      color: ZONE_COLOR,
+      color: styles.color,
+      strokeColor: styles.color,
+      fillColor: styles.fillColor,
       label: isNow ? '⚠️ CAUTION AREA' : `ℹ️ CAUTION AREA (${timeText})`,
-      labelClass: isNow ? 'text-orange-700 font-bold' : 'text-slate-600 font-bold',
+      badgeClass: styles.badgeClass,
+      levelLabel: styles.levelLabel,
+      levelStyle: styles.levelStyle,
       statusText,
       fillOpacityGlow: styles.fillOpacityGlow,
       fillOpacityPrecision: styles.fillOpacityPrecision,
@@ -1125,7 +1146,8 @@ export default function MapPage() {
           zoneId: insideZone.id,
           zoneTitle,
           category: insideZone.category || 'General Risk',
-          incidentText
+          incidentText,
+          dangerLevel: insideZone.dangerLevel
         });
         playAlertBuzzer();
       }
@@ -2304,6 +2326,7 @@ export default function MapPage() {
             autoFollow={autoFollowGps} 
             onMapInstance={(m) => { mapRef.current = m; }} 
             onUserDrag={() => setAutoFollowGps(false)} 
+            onBoundsChange={setMapBounds}
           />
           <InvalidateMapSize trigger={`${isSheetExpanded}-${routeCalculated}-${isSimulating}`} />
 
@@ -2315,8 +2338,12 @@ export default function MapPage() {
           {/* Green halos of Predefined Safe Corridors in Palanan - Removed as requested */}
 
 
-          {/* Crime Danger zones heatmaps / halos */}
-          {zones.filter(zone => zone && !isZoneResolved(zone) && zone.active !== false && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number').map((zone) => {
+          {/* Crime Danger zones heatmaps / halos: sorted ascending by level priority so High renders above Low */}
+          {zones
+            .filter(zone => zone && !isZoneResolved(zone) && zone.active !== false && zone.location && typeof zone.location.lat === 'number' && typeof zone.location.lng === 'number')
+            .slice()
+            .sort((a, b) => getZoneLevelPriority(a) - getZoneLevelPriority(b))
+            .map((zone) => {
             const specs = getDangerZoneSpecs(zone);
             return (
               <React.Fragment key={zone.id}>
@@ -2326,7 +2353,7 @@ export default function MapPage() {
                   radius={zone.radius * 1.5} 
                   pane="dangerZonesPane"
                   pathOptions={{ 
-                    fillColor: specs.color, 
+                    fillColor: specs.fillColor, 
                     fillOpacity: specs.fillOpacityGlow, 
                     color: 'transparent',
                     weight: 0
@@ -2338,9 +2365,9 @@ export default function MapPage() {
                   radius={zone.radius} 
                   pane="dangerZonesPane"
                   pathOptions={{ 
-                    fillColor: specs.color, 
+                    fillColor: specs.fillColor, 
                     fillOpacity: specs.fillOpacityPrecision, 
-                    color: specs.color, 
+                    color: specs.strokeColor, 
                     weight: specs.weight,
                     dashArray: specs.dashArray
                   }} 
@@ -2349,7 +2376,7 @@ export default function MapPage() {
                     <div id={`danger-zone-popup-${zone.id}`} className="text-xs p-1.5 min-w-[210px] max-w-[270px]">
                       {/* Top Header Badge */}
                       <div className="flex items-center justify-between gap-1.5 mb-1.5">
-                        <span className={`text-[10px] px-2 py-0.5 rounded-md font-bold uppercase tracking-wider ${specs.labelClass} bg-orange-50 border border-orange-200`}>
+                        <span className={`text-[10px] px-2 py-0.5 rounded-md font-bold uppercase tracking-wider ${specs.badgeClass}`}>
                           {specs.label}
                         </span>
                       </div>
@@ -2361,17 +2388,26 @@ export default function MapPage() {
                         </h4>
                       )}
 
-                      {/* Category - plain text */}
-                      {zone.category && (
-                        <div className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider mb-1">
-                          Category: {escapeHtml(zone.category)}
-                        </div>
-                      )}
+                      {/* Category and Level text side-by-side */}
+                      <div className="flex flex-wrap items-center gap-1.5 mb-1">
+                        {zone.category && (
+                          <span className="text-[10px] font-semibold text-slate-500 uppercase tracking-wider">
+                            Category: {escapeHtml(zone.category)}
+                          </span>
+                        )}
+                        <span className={`text-[10px] px-1.5 py-0.5 rounded ${specs.levelStyle.badgeClass}`}>
+                          {specs.levelLabel}
+                        </span>
+                      </div>
 
                       {/* Status stated in words */}
-                      <div className="text-xs text-slate-700 font-medium mb-1.5 flex items-center gap-1.5">
+                      <div className="text-xs text-slate-700 font-medium mb-0.5 flex items-center gap-1.5">
                         <span className="text-slate-400 text-[11px]">Status:</span>
                         <span className="font-bold text-slate-900">{specs.statusText}</span>
+                      </div>
+
+                      <div className="text-[10px] font-medium text-slate-500 mb-1.5">
+                        Level set by Barangay Palanan
                       </div>
 
                       {/* Description */}
@@ -2659,28 +2695,42 @@ export default function MapPage() {
           {/* LAST CHILDREN OF THE MAP: Heatmap in-zone segments rendered strictly on top with higher zIndex (620) */}
           {routeCalculated && activeRoute && (
             <React.Fragment key={`heatmap-layer-${activeRouteIndex}-${activeRoute.id}`}>
-              {activeInZoneSegments.map((seg, sIdx) => {
-                return (
-                  <Polyline 
-                    key={`seg-inzone-heatmap-${activeRouteIndex}-${activeRoute.id}-${sIdx}-${seg.coordinates.length}`}
+              {activeInZoneSegments.map((seg, sIdx) => (
+                <React.Fragment key={`seg-inzone-heatmap-${activeRouteIndex}-${activeRoute.id}-${sIdx}-${seg.coordinates.length}`}>
+                  {seg.outlineColor && (
+                    <Polyline
+                      positions={seg.coordinates}
+                      pane="inZoneHeatmapPane"
+                      pathOptions={{
+                        pane: 'inZoneHeatmapPane',
+                        color: seg.outlineColor,
+                        weight: 10,
+                        opacity: seg.opacity,
+                        lineCap: 'round',
+                        lineJoin: 'round',
+                        interactive: false
+                      }}
+                    />
+                  )}
+                  <Polyline
                     positions={seg.coordinates}
                     pane="inZoneHeatmapPane"
                     pathOptions={{
                       pane: 'inZoneHeatmapPane',
-                      color: ZONE_COLOR,
+                      color: seg.color,
                       weight: 8,
-                      opacity: 1.0,
+                      opacity: seg.opacity,
                       lineCap: 'round',
                       lineJoin: 'round',
                       interactive: false
                     }}
                   />
-                );
-              })}
+                </React.Fragment>
+              ))}
             </React.Fragment>
           )}
 
-          {/* Hidden self-test polyline (behind flag) that draws fixed orange polyline in inZoneHeatmapPane */}
+          {/* Hidden self-test polyline (behind flag) that draws fixed polyline in inZoneHeatmapPane */}
           {showHeatmapSelfTest && (
             <Polyline 
               key="heatmap-selftest-fixed-dian"
@@ -2688,7 +2738,7 @@ export default function MapPage() {
               pane="inZoneHeatmapPane"
               pathOptions={{
                 pane: 'inZoneHeatmapPane',
-                color: ZONE_COLOR,
+                color: ZONE_LEVEL_STYLES.high.fillColor,
                 weight: 8,
                 opacity: 1.0,
                 lineCap: 'round',
@@ -2869,33 +2919,70 @@ export default function MapPage() {
         />
 
         {/* Circles Risk Legend to sync with Admin Portal */}
-        <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-40 text-left transition-colors duration-300 ${
-          darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-800'
-        }`}>
-          <h4 className={`text-[10px] font-black tracking-wider uppercase mb-1.5 pb-1 border-b ${
-            darkMode ? 'text-slate-300 border-slate-800' : 'text-slate-800 border-slate-150'
-          }`}>
-            MAP LEGEND
-          </h4>
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <span className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border border-white" style={{ backgroundColor: ZONE_COLOR }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Caution Area</span>
+        {(() => {
+          const hasUnsetZoneOnScreen = zones.some(z => {
+            if (!z || isZoneResolved(z) || z.active === false || !z.location) return false;
+            if (normalizeZoneDangerLevel(z.dangerLevel)) return false;
+            if (!mapBounds) return true;
+            const latPad = (z.radius || 100) / 111000;
+            const lngPad = (z.radius || 100) / (111000 * Math.cos((z.location.lat * Math.PI) / 180));
+            return (
+              z.location.lat + latPad >= mapBounds.getSouth() &&
+              z.location.lat - latPad <= mapBounds.getNorth() &&
+              z.location.lng + lngPad >= mapBounds.getWest() &&
+              z.location.lng - lngPad <= mapBounds.getEast()
+            );
+          });
+
+          return (
+            <div id="danger-zones-circles-legend" className={`absolute bottom-4 right-4 z-[999] rounded-2xl shadow-xl border p-3.5 w-44 text-left transition-colors duration-300 ${
+              darkMode ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-800'
+            }`}>
+              <h4 className={`text-[10px] font-black tracking-wider uppercase mb-1.5 pb-1 border-b ${
+                darkMode ? 'text-slate-300 border-slate-800' : 'text-slate-800 border-slate-150'
+              }`}>
+                MAP LEGEND
+              </h4>
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <span
+                    className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border"
+                    style={{ backgroundColor: ZONE_LEVEL_STYLES.high.fillColor, borderColor: ZONE_LEVEL_STYLES.high.strokeColor }}
+                  />
+                  <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>High level</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span
+                    className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border-2"
+                    style={{ backgroundColor: ZONE_LEVEL_STYLES.low.fillColor, borderColor: ZONE_LEVEL_STYLES.low.strokeColor }}
+                  />
+                  <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Low level</span>
+                </div>
+                {hasUnsetZoneOnScreen && (
+                  <div className="flex items-center gap-2">
+                    <span
+                      className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border"
+                      style={{ backgroundColor: ZONE_LEVEL_STYLES.unset.fillColor, borderColor: ZONE_LEVEL_STYLES.unset.strokeColor }}
+                    />
+                    <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Level not set</span>
+                  </div>
+                )}
+                <div className="flex items-center gap-2">
+                  <span className="w-3.5 h-3.5 rounded-full shrink-0 border-2 border-dashed" style={{ borderColor: ZONE_LEVEL_STYLES.unset.strokeColor, backgroundColor: 'transparent' }} />
+                  <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Inactive right now</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-3.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: '#10B981' }} />
+                  <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Clear</span>
+                </div>
+                <div className="flex items-center gap-2 pt-0.5 border-t border-slate-100">
+                  <span className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border-2 border-white" style={{ backgroundColor: '#4285F4' }} />
+                  <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Your Location</span>
+                </div>
+              </div>
             </div>
-            <div className="flex items-center gap-2">
-              <span className="w-3.5 h-3.5 rounded-full shrink-0 border-2 border-dashed" style={{ borderColor: ZONE_COLOR, backgroundColor: 'transparent' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>Inactive right now</span>
-            </div>
-            <div className="flex items-center gap-2">
-              <span className="w-3.5 h-1.5 rounded-full shrink-0" style={{ backgroundColor: '#10B981' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Clear</span>
-            </div>
-            <div className="flex items-center gap-2 pt-0.5 border-t border-slate-100">
-              <span className="w-3.5 h-3.5 rounded-full shrink-0 shadow-xs border-2 border-white" style={{ backgroundColor: '#4285F4' }} />
-              <span className={`text-[11px] font-bold ${darkMode ? 'text-slate-300' : 'text-slate-700'}`}>Your Location</span>
-            </div>
-          </div>
-        </div>
+          );
+        })()}
 
         {/* Floating Out-of-Palanan Warning Popup like in Report page */}
         <AnimatePresence>
@@ -2955,46 +3042,63 @@ export default function MapPage() {
 
         {/* Real-time Caution Area Warning Popup */}
         <AnimatePresence>
-          {activeZoneAlert && dismissedZoneId !== activeZoneAlert.zoneId && (
-            <motion.div 
-              initial={{ y: -60, opacity: 0, scale: 0.95 }} 
-              animate={{ y: 0, opacity: 1, scale: 1 }} 
-              exit={{ y: -60, opacity: 0, scale: 0.95 }} 
-              className="absolute top-4 left-4 right-4 z-[1010]"
-            >
-              <div className="bg-[#EA580C] text-white p-3.5 rounded-2xl shadow-2xl flex items-start justify-between gap-3 border-2 border-orange-300">
-                <div className="flex items-start gap-2.5">
-                  <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 animate-bounce text-amber-200" />
-                  <div className="text-left">
-                    <h4 className="text-[10px] uppercase font-black tracking-wider leading-none mb-1 text-amber-200">
-                      CAUTION AREA DETECTED
-                    </h4>
-                    <p className="text-xs font-black leading-tight text-white mb-0.5">
-                      {activeZoneAlert.zoneTitle}
-                    </p>
-                    <p className="text-xs font-extrabold text-orange-100">
-                      You are inside a caution area
-                    </p>
-                    <div className="flex flex-wrap gap-1.5 mt-1.5 text-[10px] font-semibold text-orange-100">
-                      <span className="bg-orange-700/80 px-2 py-0.5 rounded-md border border-orange-400/40">
-                        Category: {activeZoneAlert.category}
-                      </span>
-                      <span className="bg-orange-700/80 px-2 py-0.5 rounded-md border border-orange-400/40">
-                        {activeZoneAlert.incidentText}
-                      </span>
+          {activeZoneAlert && dismissedZoneId !== activeZoneAlert.zoneId && (() => {
+            const alertStyle = getZoneLevelStyle({ dangerLevel: activeZoneAlert.dangerLevel });
+            const isLow = alertStyle.level === 'low';
+            return (
+              <motion.div 
+                initial={{ y: -60, opacity: 0, scale: 0.95 }} 
+                animate={{ y: 0, opacity: 1, scale: 1 }} 
+                exit={{ y: -60, opacity: 0, scale: 0.95 }} 
+                className="absolute top-4 left-4 right-4 z-[1010]"
+              >
+                <div
+                  data-testid="active-zone-alert-popup"
+                  className="p-3.5 rounded-2xl shadow-2xl flex items-start justify-between gap-3 border-2"
+                  style={{
+                    backgroundColor: alertStyle.accentBg,
+                    borderColor: alertStyle.accentBorder,
+                    color: alertStyle.accentText
+                  }}
+                >
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-5 h-5 shrink-0 mt-0.5 animate-bounce" style={{ color: alertStyle.accentText }} />
+                    <div className="text-left">
+                      <h4 className="text-[10px] uppercase font-black tracking-wider leading-none mb-1 opacity-85">
+                        CAUTION AREA DETECTED • {alertStyle.label.toUpperCase()}
+                      </h4>
+                      <p className="text-xs font-black leading-tight mb-0.5">
+                        {activeZoneAlert.zoneTitle}
+                      </p>
+                      <p className="text-xs font-extrabold opacity-90">
+                        You are inside a caution area ({alertStyle.label})
+                      </p>
+                      <div className="flex flex-wrap gap-1.5 mt-1.5 text-[10px] font-semibold">
+                        <span className={`px-2 py-0.5 rounded-md border ${isLow ? 'bg-amber-900/15 border-amber-900/30' : 'bg-black/20 border-white/30'}`}>
+                          {alertStyle.label}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded-md border ${isLow ? 'bg-amber-900/15 border-amber-900/30' : 'bg-black/20 border-white/30'}`}>
+                          Category: {activeZoneAlert.category}
+                        </span>
+                        <span className={`px-2 py-0.5 rounded-md border ${isLow ? 'bg-amber-900/15 border-amber-900/30' : 'bg-black/20 border-white/30'}`}>
+                          {activeZoneAlert.incidentText}
+                        </span>
+                      </div>
                     </div>
                   </div>
+                  <button
+                    type="button"
+                    onClick={() => setDismissedZoneId(activeZoneAlert.zoneId)}
+                    className={`text-[11px] font-bold px-2.5 py-1 rounded-lg transition shrink-0 cursor-pointer ${
+                      isLow ? 'bg-amber-950/20 hover:bg-amber-950/30 text-amber-950' : 'bg-white/20 hover:bg-white/30 text-white'
+                    }`}
+                  >
+                    Dismiss
+                  </button>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => setDismissedZoneId(activeZoneAlert.zoneId)}
-                  className="bg-white/20 hover:bg-white/30 text-white text-[11px] font-bold px-2.5 py-1 rounded-lg transition shrink-0 cursor-pointer"
-                >
-                  Dismiss
-                </button>
-              </div>
-            </motion.div>
-          )}
+              </motion.div>
+            );
+          })()}
         </AnimatePresence>
 
         {/* Floating live Radar incident Warnings panel */}

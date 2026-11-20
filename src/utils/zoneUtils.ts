@@ -1,10 +1,100 @@
-import { DangerZone, isZoneResolved } from '../types';
+import { DangerZone, ZoneDangerLevel, isZoneResolved } from '../types';
 import { isInsidePalanan } from '../lib/palananBounds';
 
+export type ZoneLevelKey = 'low' | 'high' | 'unset';
+
+export interface ZoneLevelStyle {
+  level: ZoneLevelKey;
+  fillColor: string;
+  strokeColor: string;
+  label: string;
+  accentBg: string;
+  accentBorder: string;
+  accentText: string;
+  badgeClass: string;
+}
+
 /**
- * Single color rule for all danger zones across the app (matches Admin Portal).
+ * Shared barangay-assigned danger level color & label rule across map, popups, legend, and route heatmaps.
+ * Identical to Admin Portal:
+ *  - low: #FACC15 with outline #A16207
+ *  - high: #DC2626
+ *  - unset (missing/invalid): neutral slate #64748B / #475569 (never defaulted to yellow or red)
  */
-export const ZONE_COLOR = '#EA580C';
+export const ZONE_LEVEL_STYLES: Record<ZoneLevelKey, ZoneLevelStyle> = {
+  low: {
+    level: 'low',
+    fillColor: '#FACC15',
+    strokeColor: '#A16207',
+    label: 'Low level',
+    accentBg: '#FACC15',
+    accentBorder: '#A16207',
+    accentText: '#422006',
+    badgeClass: 'bg-yellow-50 text-amber-900 border border-yellow-400 font-bold',
+  },
+  high: {
+    level: 'high',
+    fillColor: '#DC2626',
+    strokeColor: '#DC2626',
+    label: 'High level',
+    accentBg: '#DC2626',
+    accentBorder: '#991B1B',
+    accentText: '#FFFFFF',
+    badgeClass: 'bg-red-50 text-red-800 border border-red-300 font-bold',
+  },
+  unset: {
+    level: 'unset',
+    fillColor: '#64748B',
+    strokeColor: '#475569',
+    label: 'Level not set',
+    accentBg: '#475569',
+    accentBorder: '#64748B',
+    accentText: '#FFFFFF',
+    badgeClass: 'bg-slate-100 text-slate-700 border border-slate-300 font-bold',
+  },
+};
+
+/**
+ * Normalizes barangay-assigned dangerLevel strictly ("low" | "high").
+ * Never reads legacy riskLevel or color. Missing or invalid values return undefined.
+ */
+export function normalizeZoneDangerLevel(rawLevel: unknown): ZoneDangerLevel | undefined {
+  if (typeof rawLevel !== 'string') return undefined;
+  const norm = rawLevel.trim().toLowerCase();
+  if (norm === 'low') return 'low';
+  if (norm === 'high') return 'high';
+  return undefined;
+}
+
+export function getZoneLevelStyle(zone?: Pick<DangerZone, 'dangerLevel'> | null): ZoneLevelStyle {
+  const level = normalizeZoneDangerLevel(zone?.dangerLevel);
+  if (level === 'low') return ZONE_LEVEL_STYLES.low;
+  if (level === 'high') return ZONE_LEVEL_STYLES.high;
+  return ZONE_LEVEL_STYLES.unset;
+}
+
+/**
+ * Precedence for overlap drawing & overlap segment coloring: High (3) > Low (2) > Not set (1).
+ */
+export function getZoneLevelPriority(zone?: Pick<DangerZone, 'dangerLevel'> | null): number {
+  const level = normalizeZoneDangerLevel(zone?.dangerLevel);
+  if (level === 'high') return 3;
+  if (level === 'low') return 2;
+  return 1;
+}
+
+export function countZonesByLevel(zones: DangerZone[]): { high: number; low: number; notSet: number } {
+  let high = 0;
+  let low = 0;
+  let notSet = 0;
+  for (const z of zones) {
+    const level = normalizeZoneDangerLevel(z?.dangerLevel);
+    if (level === 'high') high++;
+    else if (level === 'low') low++;
+    else notSet++;
+  }
+  return { high, low, notSet };
+}
 
 /**
  * Escapes unsafe HTML characters to prevent XSS in Leaflet popups or HTML rendering.
@@ -120,6 +210,7 @@ export function normalizeDangerZone(raw: any, id: string = ''): DangerZone {
   }
 
   const locName = raw?.locationName ? String(raw.locationName) : (raw?.name ? String(raw.name) : undefined);
+  const dangerLevel = normalizeZoneDangerLevel(raw?.dangerLevel);
 
   return {
     id: raw?.id || id,
@@ -131,6 +222,7 @@ export function normalizeDangerZone(raw: any, id: string = ''): DangerZone {
     name: locName,
     locationName: locName,
     category: raw?.category ? String(raw.category) : undefined,
+    dangerLevel,
     addedBy: raw?.addedBy,
     createdAt: raw?.createdAt,
     active,
@@ -323,15 +415,18 @@ export function formatIncidentCountText(zone: DangerZone): string {
 }
 
 /**
- * Circle styling for Leaflet map based strictly on active status using the Single Color Rule.
- * Uses ZONE_COLOR (#EA580C) exclusively. Does NOT depend on riskLevel, category, crimeCount, or stored color.
+ * Circle styling for Leaflet map based on barangay-assigned dangerLevel and active status.
+ * Strictly ignores legacy riskLevel, category, crimeCount, or stored color.
  * - Active right now: solid border (weight 2), normal fill (0.22), normal glow (0.10).
- * - Inactive right now: dashed border ('5, 5', weight 1.5), lower fill opacity (0.08), faint glow (0.02).
+ * - Inactive right now: same level color, dashed border ('5, 5', weight 1.5), lower fill opacity (0.08), faint glow (0.02).
  */
 export function getZoneMapStyles(zone: DangerZone, isCurrentlyActive: boolean) {
+  const levelStyle = getZoneLevelStyle(zone);
+
   if (!isCurrentlyActive) {
     return {
-      color: ZONE_COLOR,
+      color: levelStyle.strokeColor,
+      fillColor: levelStyle.fillColor,
       fillOpacityGlow: 0.02,
       fillOpacityPrecision: 0.08,
       weight: 1.5,
@@ -339,18 +434,25 @@ export function getZoneMapStyles(zone: DangerZone, isCurrentlyActive: boolean) {
       badgeClass: 'bg-slate-50 text-slate-600 border border-slate-200',
       badgeText: 'Inactive right now',
       isWarning: false,
+      level: levelStyle.level,
+      levelLabel: levelStyle.label,
+      levelStyle,
     };
   }
 
   return {
-    color: ZONE_COLOR,
+    color: levelStyle.strokeColor,
+    fillColor: levelStyle.fillColor,
     fillOpacityGlow: 0.10,
     fillOpacityPrecision: 0.22,
     weight: 2,
     dashArray: '',
-    badgeClass: 'bg-orange-50 text-orange-800 border border-orange-200 font-bold',
+    badgeClass: levelStyle.badgeClass,
     badgeText: 'Currently active',
     isWarning: true,
+    level: levelStyle.level,
+    levelLabel: levelStyle.label,
+    levelStyle,
   };
 }
 

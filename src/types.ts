@@ -55,6 +55,7 @@ export interface Report {
 
 export type ZoneSource = 'barangay_data' | 'resident_report' | 'both';
 export type ZoneActiveTime = 'night_only' | 'day_only' | 'all_day';
+export type ZoneDangerLevel = 'low' | 'high';
 
 export interface DangerZone {
   id: string;
@@ -72,6 +73,7 @@ export interface DangerZone {
   latitude?: number;
   longitude?: number;
   category?: string;
+  dangerLevel?: ZoneDangerLevel;
   riskLevel?: 'low' | 'moderate' | 'high' | 'critical' | string;
   type?: 'marker' | 'circle' | 'polygon';
   polygonPoints?: [number, number][];
@@ -116,6 +118,8 @@ export type SafetyLevel = 'safe' | 'moderate' | 'danger';
 export interface RouteSegment {
   coordinates: [number, number][];
   color: string;
+  outlineColor?: string;
+  dangerLevel?: ZoneDangerLevel;
   weight?: number;
   opacity?: number;
   inZone?: boolean;

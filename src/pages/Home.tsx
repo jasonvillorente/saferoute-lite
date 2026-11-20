@@ -13,7 +13,8 @@ import { isInsidePalanan } from '../lib/palananBounds';
 import { 
   normalizeDangerZone, 
   isZoneActiveNow, 
-  calculateHomeSafetyScore 
+  calculateHomeSafetyScore,
+  countZonesByLevel
 } from '../utils/zoneUtils';
 
 export default function Home() {
@@ -110,6 +111,8 @@ export default function Home() {
   const activeNowZones = zones.filter(z => isZoneActiveNow(z));
   const totalZonesCount = zones.length;
   const activeNowCount = activeNowZones.length;
+  const activeLevelSplit = countZonesByLevel(activeNowZones);
+  const totalLevelSplit = countZonesByLevel(zones);
 
   // Count-based formula with crime contribution capped at 30 points
   const globalSafetyScore = calculateHomeSafetyScore(activeNowZones);
@@ -189,6 +192,9 @@ export default function Home() {
           </div>
           <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{activeNowCount}</div>
           <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">Active Now ({ZONE_LABEL_PLURAL})</div>
+          <div data-testid="home-active-level-split" className={`text-[11px] font-semibold mt-1.5 ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+            High: {activeLevelSplit.high}, Low: {activeLevelSplit.low}, Not set: {activeLevelSplit.notSet}
+          </div>
         </div>
         
         <div className={`p-5 rounded-3xl border ${darkMode ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-100 shadow-sm'}`}>
@@ -197,6 +203,9 @@ export default function Home() {
           </div>
           <div className={`text-3xl font-black ${darkMode ? 'text-white' : 'text-slate-900'}`}>{totalZonesCount}</div>
           <div className="text-xs text-slate-400 font-bold uppercase tracking-wider mt-1">Total {ZONE_LABEL_PLURAL}</div>
+          <div data-testid="home-total-level-split" className={`text-[11px] font-semibold mt-1.5 ${darkMode ? 'text-slate-300' : 'text-slate-600'}`}>
+            High: {totalLevelSplit.high}, Low: {totalLevelSplit.low}, Not set: {totalLevelSplit.notSet}
+          </div>
         </div>
       </div>
 

@@ -4,7 +4,7 @@
  */
 import { PALANAN_BOUNDS, isInsidePalanan } from '../src/lib/palananBounds';
 import { DangerZone, isZoneResolved } from '../src/types';
-import { normalizeDangerZone, isZoneCurrentlyActive, ZONE_COLOR } from '../src/utils/zoneUtils';
+import { normalizeDangerZone, isZoneCurrentlyActive } from '../src/utils/zoneUtils';
 
 function getDistanceMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6371000;

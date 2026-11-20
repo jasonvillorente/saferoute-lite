@@ -9,8 +9,14 @@ import {
   calculateHomeSafetyScore,
   escapeHtml,
   getZoneMapStyles,
-  ZONE_COLOR
+  getZoneLevelStyle,
+  getZoneLevelPriority,
+  countZonesByLevel,
+  normalizeZoneDangerLevel,
+  ZONE_LEVEL_STYLES
 } from './zoneUtils';
+import fs from 'fs';
+import path from 'path';
 import { DangerZone, isZoneResolved } from '../types';
 import { getDistanceMeters } from './routeUtils';
 
@@ -83,6 +89,7 @@ assert(oldRecord.source === 'resident_report', 'Old record source defaults to re
 assert(oldRecord.activeTime === 'all_day', 'Old record activeTime defaults to all_day');
 assert(oldRecord.crimeCount === 0, 'Old record crimeCount defaults to 0');
 assert(JSON.stringify(oldRecord.crimeTypes) === '{}', 'Old record crimeTypes defaults to {}');
+assert(oldRecord.dangerLevel === undefined, 'Old record with only legacy riskLevel="high" has dangerLevel=undefined');
 assert(isZoneActiveNow(oldRecord), 'Old unmigrated record defaults to all_day and is active');
 
 // 5. Popup text for each source type
@@ -128,17 +135,25 @@ const unsafeXss = '<script>alert("xss")</script>&"\'';
 const escaped = escapeHtml(unsafeXss);
 assert(!escaped.includes('<script>') && escaped.includes('&lt;script&gt;') && escaped.includes('&quot;'), 'escapeHtml escapes unsafe script tags and quotes');
 
-// 9. Home score formula with cap at 30 points
+// 9. Home score formula with cap at 30 points (independent of dangerLevel)
 const emptyScore = calculateHomeSafetyScore([]);
 assert(emptyScore === 100, 'Zero active zones produces 100% safety score');
 
 const zonesWithHighCrimes = [
+  normalizeDangerZone({ crimeCount: 20, dangerLevel: 'low' }),
+  normalizeDangerZone({ crimeCount: 20, dangerLevel: 'high' })
+];
+const zonesWithHighCrimesUnset = [
   normalizeDangerZone({ crimeCount: 20 }),
   normalizeDangerZone({ crimeCount: 20 })
 ];
 // 2 zones -> presence = 10. Total crimes = 40 -> crime penalty = min(30, 120) = 30.
 // Score = 100 - 10 - 30 = 60.
 assert(calculateHomeSafetyScore(zonesWithHighCrimes) === 60, 'Home safety score correctly caps crime contribution at 30 points');
+assert(
+  calculateHomeSafetyScore(zonesWithHighCrimes) === calculateHomeSafetyScore(zonesWithHighCrimesUnset),
+  'Home safety score formula is unaffected by dangerLevel'
+);
 
 // 10. Simulated Clock Override Tests
 const nightZone = normalizeDangerZone({ id: 'nz-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'night_only', startHour: 18, endHour: 5 });
@@ -179,15 +194,19 @@ assert(isZoneCurrentlyActive(simAllDayZone, true, 22) === true, 'All-day zone ac
 const resolvedNight = normalizeDangerZone({ id: 'rn-1', latitude: 14.56038, longitude: 120.99800, activeTime: 'night_only', isResolved: true });
 assert(isZoneCurrentlyActive(resolvedNight, true, 22) === false, 'Resolved zone remains INACTIVE during simulated 10 PM');
 
-// 11. Single Color Rule tests (#EA580C)
-assert(ZONE_COLOR === '#EA580C', 'ZONE_COLOR constant is strictly #EA580C');
+// 11. Barangay-assigned dangerLevel color & normalization tests
+assert(ZONE_LEVEL_STYLES.low.fillColor === '#FACC15' && ZONE_LEVEL_STYLES.low.strokeColor === '#A16207', 'Low dangerLevel colors match portal (#FACC15 fill, #A16207 outline)');
+assert(ZONE_LEVEL_STYLES.high.fillColor === '#DC2626' && ZONE_LEVEL_STYLES.high.strokeColor === '#DC2626', 'High dangerLevel color matches portal (#DC2626)');
+assert(ZONE_LEVEL_STYLES.unset.fillColor === '#64748B' && ZONE_LEVEL_STYLES.unset.strokeColor === '#475569', 'Unset dangerLevel uses neutral slate (#64748B / #475569)');
+assert(ZONE_LEVEL_STYLES.unset.label === 'Level not set', 'Unset dangerLevel label is "Level not set"');
 
-const mockCriticalZone = normalizeDangerZone({
-  id: 'crit-1',
+const mockHighZone = normalizeDangerZone({
+  id: 'high-1',
   name: 'Robbery Hotspot',
   category: 'Theft',
-  riskLevel: 'critical',
-  color: '#DC2626', // Red in legacy record
+  dangerLevel: 'high',
+  riskLevel: 'low',
+  color: '#10B981',
   crimeCount: 25,
   latitude: 14.56038,
   longitude: 120.99800
@@ -197,32 +216,60 @@ const mockLowZone = normalizeDangerZone({
   id: 'low-1',
   name: 'Minor Alley',
   category: 'Noise',
-  riskLevel: 'low',
-  color: '#10B981', // Green in legacy record
+  dangerLevel: 'low',
+  riskLevel: 'critical',
+  color: '#10B981',
   crimeCount: 0,
   latitude: 14.56038,
   longitude: 120.99800
 });
 
-// A: Active zone styles use ZONE_COLOR regardless of riskLevel, category, color, or crimeCount
-const activeCritStyle = getZoneMapStyles(mockCriticalZone, true);
+const mockUnsetZone = normalizeDangerZone({
+  id: 'unset-1',
+  name: 'Legacy Zone',
+  riskLevel: 'critical',
+  color: '#EF4444',
+  crimeCount: 12,
+  latitude: 14.56038,
+  longitude: 120.99800
+});
+
+assert(mockHighZone.dangerLevel === 'high', 'normalizeDangerZone keeps dangerLevel="high"');
+assert(mockLowZone.dangerLevel === 'low', 'normalizeDangerZone keeps dangerLevel="low"');
+assert(mockUnsetZone.dangerLevel === undefined, 'normalizeDangerZone leaves missing dangerLevel undefined even when riskLevel/color are present');
+assert(normalizeZoneDangerLevel(' HIGH ') === 'high' && normalizeZoneDangerLevel('moderate') === undefined, 'normalizeZoneDangerLevel validates strictly');
+
+// A: Active zone styles follow dangerLevel strictly
+const activeHighStyle = getZoneMapStyles(mockHighZone, true);
 const activeLowStyle = getZoneMapStyles(mockLowZone, true);
+const activeUnsetStyle = getZoneMapStyles(mockUnsetZone, true);
 
-assert(activeCritStyle.color === '#EA580C', 'Critical zone with legacy red color uses ZONE_COLOR #EA580C when active');
-assert(activeLowStyle.color === '#EA580C', 'Low risk zone with legacy green color uses ZONE_COLOR #EA580C when active');
-assert(activeCritStyle.dashArray === '', 'Active zone uses solid border (empty dashArray)');
-assert(activeCritStyle.weight === 2, 'Active zone uses solid weight 2');
-assert(activeCritStyle.fillOpacityPrecision === 0.22, 'Active zone uses normal fillOpacity 0.22');
+assert(activeHighStyle.fillColor === '#DC2626' && activeHighStyle.color === '#DC2626', 'Active High zone renders in #DC2626 regardless of legacy riskLevel/color');
+assert(activeLowStyle.fillColor === '#FACC15' && activeLowStyle.color === '#A16207', 'Active Low zone renders in #FACC15 with #A16207 outline');
+assert(activeUnsetStyle.fillColor === '#64748B' && activeUnsetStyle.color === '#475569', 'Active unset zone renders in neutral slate (never yellow or red)');
+assert(activeHighStyle.dashArray === '' && activeLowStyle.dashArray === '' && activeUnsetStyle.dashArray === '', 'Active zones use solid border');
+assert(activeHighStyle.weight === 2, 'Active zone uses solid weight 2');
+assert(activeHighStyle.fillOpacityPrecision === 0.22 && activeHighStyle.fillOpacityGlow === 0.10, 'Active zone uses 0.22 fill and 0.10 glow');
 
-// B: Inactive zone styles use ZONE_COLOR, dashed border, lower fill opacity
-const inactiveCritStyle = getZoneMapStyles(mockCriticalZone, false);
+// B: Inactive zone styles keep same level color, dashed border, lower fill opacity
+const inactiveHighStyle = getZoneMapStyles(mockHighZone, false);
 const inactiveLowStyle = getZoneMapStyles(mockLowZone, false);
+const inactiveUnsetStyle = getZoneMapStyles(mockUnsetZone, false);
 
-assert(inactiveCritStyle.color === '#EA580C', 'Inactive zone uses ZONE_COLOR #EA580C');
-assert(inactiveCritStyle.dashArray === '5, 5', 'Inactive zone uses dashed border (5, 5)');
-assert(inactiveCritStyle.fillOpacityPrecision === 0.08, 'Inactive zone uses lower fillOpacity 0.08');
-assert(inactiveCritStyle.fillOpacityGlow === 0.02, 'Inactive zone uses faint glow 0.02');
-assert(inactiveCritStyle.color === inactiveLowStyle.color, 'Inactive styles are identical regardless of zone fields');
+assert(inactiveHighStyle.fillColor === '#DC2626' && inactiveHighStyle.color === '#DC2626', 'Inactive High zone preserves #DC2626');
+assert(inactiveLowStyle.fillColor === '#FACC15' && inactiveLowStyle.color === '#A16207', 'Inactive Low zone preserves #FACC15 / #A16207');
+assert(inactiveUnsetStyle.fillColor === '#64748B' && inactiveUnsetStyle.color === '#475569', 'Inactive unset zone preserves neutral slate');
+assert(inactiveHighStyle.dashArray === '5, 5' && inactiveHighStyle.weight === 1.5, 'Inactive zone uses dashed border (5, 5) weight 1.5');
+assert(inactiveHighStyle.fillOpacityPrecision === 0.08 && inactiveHighStyle.fillOpacityGlow === 0.02, 'Inactive zone uses 0.08 fill and 0.02 glow');
+
+// C: Overlap drawing priority & Home counts split
+assert(
+  getZoneLevelPriority(mockHighZone) > getZoneLevelPriority(mockLowZone) &&
+  getZoneLevelPriority(mockLowZone) > getZoneLevelPriority(mockUnsetZone),
+  'Overlap priority strictly High > Low > Level not set'
+);
+const levelCounts = countZonesByLevel([mockHighZone, mockLowZone, mockUnsetZone, normalizeDangerZone({ dangerLevel: 'invalid', latitude: 14.56038, longitude: 120.99800 })]);
+assert(levelCounts.high === 1 && levelCounts.low === 1 && levelCounts.notSet === 2, 'countZonesByLevel accurately splits High, Low, and Not set counts');
 
 // 12. Contract field mapping and boundary validation tests
 const contractDoc = {
@@ -332,8 +379,8 @@ for (const v of variations) {
   const z = normalizeDangerZone({ latitude: 14.56038, longitude: 120.99800, ...v });
   const activeStyle = getZoneMapStyles(z, true);
   const inactiveStyle = getZoneMapStyles(z, false);
-  assert(activeStyle.color === ZONE_COLOR, `Active style strictly matches ZONE_COLOR for riskLevel: ${v.riskLevel}`);
-  assert(inactiveStyle.color === ZONE_COLOR, `Inactive style strictly matches ZONE_COLOR for riskLevel: ${v.riskLevel}`);
+  assert(activeStyle.fillColor === ZONE_LEVEL_STYLES.unset.fillColor && activeStyle.color === ZONE_LEVEL_STYLES.unset.strokeColor, `Active style ignores legacy riskLevel/color and uses slate for riskLevel: ${v.riskLevel}`);
+  assert(inactiveStyle.fillColor === ZONE_LEVEL_STYLES.unset.fillColor && inactiveStyle.color === ZONE_LEVEL_STYLES.unset.strokeColor, `Inactive style ignores legacy riskLevel/color and uses slate for riskLevel: ${v.riskLevel}`);
   assert(activeStyle.dashArray === '', 'Active style always has solid border');
   assert(inactiveStyle.dashArray === '5, 5', 'Inactive style always has dashed border');
 }
@@ -428,5 +475,31 @@ assert(alertWithinHysteresis === 'trans-zone', 'Active zone: 15m exit hysteresis
 const farPos: [number, number] = [14.56038 + 0.0008, 120.99800]; // ~88 meters away
 const alertBeyondHysteresis = evaluateProximityAlert(farPos, [windowTestZone], true, 22, activeAlertId);
 assert(alertBeyondHysteresis === null, 'Active zone: moving beyond radius + 15m clears alert');
+
+// 20. Resident report isolation & UI copy contract verification
+const reportSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/pages/Report.tsx'), 'utf8');
+const mapSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/pages/MapPage.tsx'), 'utf8');
+const homeSrc = fs.readFileSync(path.resolve(process.cwd(), 'src/pages/Home.tsx'), 'utf8');
+
+assert(
+  reportSrc.includes('Your report will be reviewed by the Barangay. Officials decide whether it becomes a caution area and its level.'),
+  'Report.tsx confirmation message states Barangay officials decide caution area & level'
+);
+assert(
+  !reportSrc.includes('dangerLevel'),
+  'Report.tsx never exposes a dangerLevel selector or field to residents'
+);
+assert(
+  !mapSrc.includes("collection(db, 'reports')") &&
+  !mapSrc.includes("collection(db, 'incident_reports')") &&
+  !homeSrc.includes("collection(db, 'reports')") &&
+  !homeSrc.includes("collection(db, 'incident_reports')"),
+  'MapPage.tsx and Home.tsx never read resident report collections as zones (only danger_zones / danger__zones)'
+);
+assert(
+  mapSrc.includes('Level set by Barangay Palanan') &&
+  mapSrc.includes('hasUnsetZoneOnScreen'),
+  'MapPage.tsx popup displays "Level set by Barangay Palanan" and conditional "Level not set" legend'
+);
 
 console.log(`\n--- TEST RUN FINISHED: ${passedTests}/${totalTests} PASSED ---`);

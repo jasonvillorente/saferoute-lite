@@ -1,8 +1,9 @@
-import { normalizeDangerZone } from './zoneUtils';
+import { normalizeDangerZone, ZONE_LEVEL_STYLES } from './zoneUtils';
 import {
   generateSuggestedRoutes,
   processRoutePipeline,
   computeRouteZoneMetrics,
+  computeInZonePolylinesAtRenderTime,
   areRoutesNearDuplicates,
   getDistanceMeters,
   isRouteClearingAllZones,
@@ -575,7 +576,7 @@ async function runTests() {
   assert(straightMetrics.metersInside > 0, 'densified geometry correctly identifies in-zone segment: metersInside > 0 (got ' + straightMetrics.metersInside + 'm)');
   const inZoneSeg = straightMetrics.segments.find(s => s.inZone);
   assert(inZoneSeg !== undefined, 'densified geometry produces in-zone segment');
-  assert(inZoneSeg?.color === '#EA580C', 'in-zone segment color is #EA580C');
+  assert(inZoneSeg?.color === ZONE_LEVEL_STYLES.unset.fillColor, 'in-zone segment color matches level style (#64748B when unset)');
   assert(inZoneSeg?.weight === 8, 'in-zone segment weight is 8');
   assert(straightMetrics.segments.some(s => !s.inZone && s.color === '#10B981'), 'outer segments remain green (#10B981)');
 
@@ -629,9 +630,9 @@ async function runTests() {
     false,
     null
   );
-  const crossingOrangeSegments = crossingMetrics.segments.filter(s => s.inZone && s.color === '#EA580C');
-  assert(crossingOrangeSegments.length >= 1, 'a route crossing a circle produces at least one orange segment');
-  assert(crossingOrangeSegments[0].weight === 8, 'orange in-zone segment has thick weight of 8');
+  const crossingInZoneSegments = crossingMetrics.segments.filter(s => s.inZone && s.color === ZONE_LEVEL_STYLES.unset.fillColor);
+  assert(crossingInZoneSegments.length >= 1, 'a route crossing a circle produces at least one level-colored in-zone segment');
+  assert(crossingInZoneSegments[0].weight === 8, 'in-zone segment has thick weight of 8');
 
   // TEST 28: The orange segment sits on top of the green line (higher z-order)
   const paneZIndices = {
@@ -1146,6 +1147,150 @@ async function runTests() {
   // TEST 39: Route debug flag strictly false in production
   assert(isMapDebugEnabled({ PROD: true, DEV: false }) === false, 'Route debug line flag is strictly disabled in production (PROD=true)');
   assert(isMapDebugEnabled({ PROD: true, DEV: true, VITE_MAP_DEBUG: 'true' }) === false, 'PROD=true overrides VITE_MAP_DEBUG=true');
+
+  // TEST 40: Per-zone in-zone segment colors, splitting across zones, and High-over-Low overlap precedence
+  const zLowSeg = normalizeDangerZone({
+    id: 'z-seg-low',
+    location: { lat: 14.55820, lng: 120.99920 },
+    radius: 50,
+    active: true,
+    activeTime: 'all_day',
+    crimeCount: 3,
+    dangerLevel: 'low'
+  });
+  const zHighSeg = normalizeDangerZone({
+    id: 'z-seg-high',
+    location: { lat: 14.55720, lng: 120.99920 },
+    radius: 50,
+    active: true,
+    activeTime: 'all_day',
+    crimeCount: 4,
+    dangerLevel: 'high'
+  });
+  const multiZonePath: [number, number][] = [
+    [14.55900, 120.99920],
+    [14.55640, 120.99920]
+  ];
+  const multiMetrics = computeRouteZoneMetrics(multiZonePath, 300, 220, [zLowSeg, zHighSeg], false, null);
+  const lowSegments = multiMetrics.segments.filter(s => s.inZone && s.dangerLevel === 'low');
+  const highSegments = multiMetrics.segments.filter(s => s.inZone && s.dangerLevel === 'high');
+  assert(lowSegments.length >= 1 && lowSegments[0].color === '#FACC15' && lowSegments[0].outlineColor === '#A16207', 'Low zone segment renders yellow (#FACC15) with #A16207 outline');
+  assert(highSegments.length >= 1 && highSegments[0].color === '#DC2626', 'High zone segment renders red (#DC2626)');
+
+  // Overlapping Low + High zones: High wins in overlap
+  const overlapLow = normalizeDangerZone({
+    id: 'z-ov-low',
+    location: { lat: 14.55740, lng: 120.99920 },
+    radius: 70,
+    active: true,
+    dangerLevel: 'low',
+    crimeCount: 9
+  });
+  const overlapHigh = normalizeDangerZone({
+    id: 'z-ov-high',
+    location: { lat: 14.55740, lng: 120.99920 },
+    radius: 45,
+    active: true,
+    dangerLevel: 'high',
+    crimeCount: 1
+  });
+  const overlapRenderSegs = computeInZonePolylinesAtRenderTime([[14.55820, 120.99920], [14.55660, 120.99920]], [overlapLow, overlapHigh]);
+  assert(
+    overlapRenderSegs.some(s => s.zoneId === 'z-ov-high' && s.color === '#DC2626') &&
+    overlapRenderSegs.some(s => s.zoneId === 'z-ov-low' && s.color === '#FACC15'),
+    'Overlapping High & Low zones split at inner boundary and High (#DC2626) wins inside overlap even with lower crimeCount'
+  );
+
+  // TEST 41: sessionTripCache key includes dangerLevel and invalidates on level change
+  clearSessionTripCache();
+  let levelCacheFetches = 0;
+  const levelCacheFetchFn = async (url: string) => {
+    levelCacheFetches++;
+    const segs = url.split('/foot/')[1]?.split('?')[0]?.split(';') || [];
+    if (segs.length === 2) {
+      return (palananFixtures as any).direct;
+    }
+    return (palananFixtures as any).wp_right_124 || (palananFixtures as any).trip_925m_verified_avoiding;
+  };
+  const mockEmptyOrs = async () => ({ status: 200, features: [] });
+  const zLevelLow = normalizeDangerZone({ ...recordedTripZone, id: 'z-cache-lvl', dangerLevel: 'low' });
+  const zLevelHigh = normalizeDangerZone({ ...recordedTripZone, id: 'z-cache-lvl', dangerLevel: 'high' });
+  await generateSuggestedRoutes(tripStart, tripEnd, [zLevelLow], false, null, levelCacheFetchFn, undefined, { orsFetchFn: mockEmptyOrs });
+  const fetchesAfterLow = levelCacheFetches;
+  await generateSuggestedRoutes(tripStart, tripEnd, [zLevelLow], false, null, levelCacheFetchFn, undefined, { orsFetchFn: mockEmptyOrs });
+  assert(levelCacheFetches === fetchesAfterLow, 'sessionTripCache hits when zone dangerLevel is unchanged');
+  await generateSuggestedRoutes(tripStart, tripEnd, [zLevelHigh], false, null, levelCacheFetchFn, undefined, { orsFetchFn: mockEmptyOrs });
+  assert(levelCacheFetches > fetchesAfterLow, 'sessionTripCache invalidates when zone dangerLevel changes from low to high');
+
+  // TEST 42: Regression test — routes, distances, labels, scores, messages, and candidate order are IDENTICAL regardless of dangerLevel
+  const regCandidates: RawRouteCandidate[] = [
+    {
+      coordinates: [[14.55915, 120.99920], [14.55740, 120.99920], [14.55565, 120.99920]],
+      distance: 389,
+      duration: 290,
+      steps: []
+    },
+    {
+      coordinates: [
+        [14.55915, 120.99920],
+        [14.55915, 121.00080],
+        [14.55565, 121.00080],
+        [14.55565, 120.99920]
+      ],
+      distance: 680,
+      duration: 510,
+      steps: []
+    }
+  ];
+  const makeZoneWithLevel = (dangerLevel?: 'low' | 'high') => normalizeDangerZone({
+    id: 'reg-zone-1',
+    location: { lat: 14.55740, lng: 120.99920 },
+    radius: 74,
+    crimeCount: 8,
+    active: true,
+    activeTime: 'all_day',
+    dangerLevel
+  });
+  const regUnset = processRoutePipeline({ candidates: regCandidates, start: tripStart, end: tripEnd, zones: [makeZoneWithLevel(undefined)], isSim: false, simHour: null });
+  const regLow = processRoutePipeline({ candidates: regCandidates, start: tripStart, end: tripEnd, zones: [makeZoneWithLevel('low')], isSim: false, simHour: null });
+  const regHigh = processRoutePipeline({ candidates: regCandidates, start: tripStart, end: tripEnd, zones: [makeZoneWithLevel('high')], isSim: false, simHour: null });
+
+  const extractInvariants = (res: ReturnType<typeof processRoutePipeline>) => ({
+    statusMessage: res.statusMessage,
+    warning: res.warning,
+    avoidanceStatus: res.avoidanceStatus,
+    routes: res.routes.map(r => ({
+      id: r.id,
+      name: r.name,
+      safety: r.safety,
+      safetyScore: r.safetyScore,
+      distance: r.distance,
+      duration: r.duration,
+      metersInside: r.metersInside,
+      metersBuffer: r.metersBuffer,
+      minClearance: r.minClearance,
+      summaryText: r.summaryText,
+      coordinates: r.coordinates
+    }))
+  });
+
+  const snapRegUnset = JSON.stringify(extractInvariants(regUnset));
+  const snapRegLow = JSON.stringify(extractInvariants(regLow));
+  const snapRegHigh = JSON.stringify(extractInvariants(regHigh));
+  assert(snapRegUnset === snapRegLow && snapRegUnset === snapRegHigh, 'Regression: processRoutePipeline routes, distances, labels, scores, messages, and candidate order are 100% identical across unset, low, and high');
+
+  clearSessionTripCache();
+  const genUnset = await generateSuggestedRoutes(tripStart, tripEnd, [makeZoneWithLevel(undefined)], false, null, countingFetch);
+  clearSessionTripCache();
+  const genLow = await generateSuggestedRoutes(tripStart, tripEnd, [makeZoneWithLevel('low')], false, null, countingFetch);
+  clearSessionTripCache();
+  const genHigh = await generateSuggestedRoutes(tripStart, tripEnd, [makeZoneWithLevel('high')], false, null, countingFetch);
+
+  assert(
+    JSON.stringify(extractInvariants(genUnset)) === JSON.stringify(extractInvariants(genLow)) &&
+    JSON.stringify(extractInvariants(genUnset)) === JSON.stringify(extractInvariants(genHigh)),
+    'Regression: generateSuggestedRoutes output (routes, distances, labels, scores, messages, candidate order) is 100% identical across unset, low, and high'
+  );
 
   console.log(`\n--- ALL CONSOLIDATED TESTS PASSED: ${passedTests}/${totalTests} ---`);
 }

@@ -1,5 +1,5 @@
-import { DangerZone, CalculatedRoute, RouteSegment, SafetyLevel, AvoidanceStatus, isZoneResolved } from '../types';
-import { isZoneCurrentlyActive, ZONE_COLOR } from './zoneUtils';
+import { DangerZone, CalculatedRoute, RouteSegment, SafetyLevel, AvoidanceStatus, ZoneDangerLevel, isZoneResolved } from '../types';
+import { isZoneCurrentlyActive, getZoneLevelStyle, getZoneLevelPriority, ZONE_LEVEL_STYLES } from './zoneUtils';
 import { isInsidePalanan } from '../lib/palananBounds';
 import { getApiUrl, isNativeMissingApiBaseUrl, getCachedApiHealth } from '../lib/apiConfig';
 import palananFixtures from './fixtures/palananTripFixtures.json';
@@ -295,6 +295,7 @@ export function computeRouteZoneMetrics(
 
   const segments: RouteSegment[] = [];
   let currentSegment: RouteSegment | null = null;
+  let currentSegmentZoneId: string | null = null;
 
   for (let i = 0; i < densifiedCoords.length - 1; i++) {
     const p1 = densifiedCoords[i];
@@ -304,6 +305,7 @@ export function computeRouteZoneMetrics(
     let segMaxCrime = 0;
     let isSegInside = false;
     let isSegBuffer = false;
+    let dominantInsideZone: DangerZone | null = null;
 
     for (const zone of activeNowZones) {
       const d = getMinDistanceToSegmentMeters(p1[0], p1[1], p2[0], p2[1], zone.location.lat, zone.location.lng);
@@ -312,6 +314,16 @@ export function computeRouteZoneMetrics(
         const crime = zone.crimeCount || 0;
         if (crime > segMaxCrime) segMaxCrime = crime;
         crimeWeightedExposure += crime * segDist;
+
+        const zPriority = getZoneLevelPriority(zone);
+        const domPriority = dominantInsideZone ? getZoneLevelPriority(dominantInsideZone) : -1;
+        if (
+          !dominantInsideZone ||
+          zPriority > domPriority ||
+          (zPriority === domPriority && crime > (dominantInsideZone.crimeCount || 0))
+        ) {
+          dominantInsideZone = zone;
+        }
       } else if (d <= zone.radius * 1.5) {
         isSegBuffer = true;
       }
@@ -324,27 +336,36 @@ export function computeRouteZoneMetrics(
     }
 
     let segColor = '#10B981';
+    let segOutlineColor: string | undefined = undefined;
+    let segDangerLevel: ZoneDangerLevel | undefined = undefined;
     let segWeight = 5;
-    let segOpacity = 1.0;
+    const segOpacity = 1.0;
+    const segZoneId = dominantInsideZone ? (dominantInsideZone.id || null) : null;
 
     if (isSegInside) {
-      segColor = ZONE_COLOR;
+      const levelStyle = dominantInsideZone ? getZoneLevelStyle(dominantInsideZone) : ZONE_LEVEL_STYLES.unset;
+      segColor = levelStyle.fillColor;
+      segOutlineColor = levelStyle.level === 'low' ? levelStyle.strokeColor : undefined;
+      segDangerLevel = levelStyle.level === 'unset' ? undefined : levelStyle.level;
       segWeight = 8;
-      segOpacity = 1.0;
     }
 
     if (!currentSegment) {
       currentSegment = {
         coordinates: [p1, p2],
         color: segColor,
+        outlineColor: segOutlineColor,
+        dangerLevel: segDangerLevel,
         weight: segWeight,
         opacity: segOpacity,
         inZone: isSegInside,
         crimeCount: segMaxCrime
       };
+      currentSegmentZoneId = segZoneId;
     } else if (
       currentSegment.color === segColor &&
       currentSegment.inZone === isSegInside &&
+      currentSegmentZoneId === segZoneId &&
       Math.abs((currentSegment.opacity || 1.0) - segOpacity) < 0.05
     ) {
       currentSegment.coordinates.push(p2);
@@ -353,11 +374,14 @@ export function computeRouteZoneMetrics(
       currentSegment = {
         coordinates: [p1, p2],
         color: segColor,
+        outlineColor: segOutlineColor,
+        dangerLevel: segDangerLevel,
         weight: segWeight,
         opacity: segOpacity,
         inZone: isSegInside,
         crimeCount: segMaxCrime
       };
+      currentSegmentZoneId = segZoneId;
     }
   }
 
@@ -962,9 +986,9 @@ export async function generateSuggestedRoutes(
     return isZoneCurrentlyActive(zone, isSim, simHour);
   });
 
-  // 1. Session Cache Check (includes zone lat, lng, radius, and crimeCount)
+  // 1. Session Cache Check (includes zone id, lat, lng, radius, crimeCount, and dangerLevel)
   const activeZoneKey = activeNowZones
-    .map(z => `${z.id}:${z.location.lat.toFixed(5)},${z.location.lng.toFixed(5)}:${z.radius}:${z.crimeCount || 0}`)
+    .map(z => `${z.id}:${z.location.lat.toFixed(5)},${z.location.lng.toFixed(5)}:${z.radius}:${z.crimeCount || 0}:${z.dangerLevel || 'unset'}`)
     .sort()
     .join(';');
   const startLatKey = options?.isCurrentLocation
@@ -1775,12 +1799,17 @@ export interface InZonePolylineSegment {
   coordinates: [number, number][];
   crimeCount: number;
   zoneId: string;
+  color: string;
+  outlineColor?: string;
+  opacity: number;
+  dangerLevel?: ZoneDangerLevel;
 }
 
 /**
  * Computes in-zone segments at render time directly from displayed route coordinates
  * (densified to 10m) and the currently active zones.
- * Merges consecutive in-zone points into a single polyline per zone entry.
+ * Splits segments when crossing between different zones so each crossed zone renders
+ * in its own dangerLevel color, and High level wins in overlapping zones.
  */
 export function computeInZonePolylinesAtRenderTime(
   coords: [number, number][],
@@ -1789,7 +1818,15 @@ export function computeInZonePolylinesAtRenderTime(
   if (!coords || coords.length < 2 || !activeZones || activeZones.length === 0) return [];
   const densified = densifyCoordinates(coords, 10);
   const polylines: InZonePolylineSegment[] = [];
-  let currentGroup: { points: [number, number][]; maxCrime: number; zoneId: string } | null = null;
+  let currentGroup: {
+    points: [number, number][];
+    maxCrime: number;
+    zoneId: string;
+    color: string;
+    outlineColor?: string;
+    opacity: number;
+    dangerLevel?: ZoneDangerLevel;
+  } | null = null;
 
   for (let i = 0; i < densified.length; i++) {
     const pt = densified[i];
@@ -1798,18 +1835,58 @@ export function computeInZonePolylinesAtRenderTime(
       if (!z.location || typeof z.location.lat !== 'number' || typeof z.location.lng !== 'number') continue;
       const d = getDistanceMeters(pt[0], pt[1], z.location.lat, z.location.lng);
       if (d <= z.radius) {
-        if (!insideZone || (z.crimeCount || 0) > (insideZone.crimeCount || 0)) {
+        const zPriority = getZoneLevelPriority(z);
+        const insidePriority = insideZone ? getZoneLevelPriority(insideZone) : -1;
+        if (
+          !insideZone ||
+          zPriority > insidePriority ||
+          (zPriority === insidePriority && (z.crimeCount || 0) > (insideZone.crimeCount || 0))
+        ) {
           insideZone = z;
         }
       }
     }
 
     if (insideZone) {
+      const zoneId = insideZone.id || 'zone';
+      const levelStyle = getZoneLevelStyle(insideZone);
+      const segColor = levelStyle.fillColor;
+      const segOutlineColor = levelStyle.level === 'low' ? levelStyle.strokeColor : undefined;
+      const segDangerLevel = levelStyle.level === 'unset' ? undefined : levelStyle.level;
+
       if (!currentGroup) {
         currentGroup = {
           points: i > 0 ? [densified[i - 1], pt] : [pt],
           maxCrime: insideZone.crimeCount || 0,
-          zoneId: insideZone.id || 'zone'
+          zoneId,
+          color: segColor,
+          outlineColor: segOutlineColor,
+          opacity: 1.0,
+          dangerLevel: segDangerLevel
+        };
+      } else if (currentGroup.zoneId !== zoneId) {
+        if (currentGroup.points.length < 2) {
+          currentGroup.points.push(pt);
+        }
+        if (currentGroup.points.length >= 2) {
+          polylines.push({
+            coordinates: currentGroup.points,
+            crimeCount: currentGroup.maxCrime,
+            zoneId: currentGroup.zoneId,
+            color: currentGroup.color,
+            outlineColor: currentGroup.outlineColor,
+            opacity: currentGroup.opacity,
+            dangerLevel: currentGroup.dangerLevel
+          });
+        }
+        currentGroup = {
+          points: i > 0 ? [densified[i - 1], pt] : [pt],
+          maxCrime: insideZone.crimeCount || 0,
+          zoneId,
+          color: segColor,
+          outlineColor: segOutlineColor,
+          opacity: 1.0,
+          dangerLevel: segDangerLevel
         };
       } else {
         currentGroup.points.push(pt);
@@ -1824,7 +1901,11 @@ export function computeInZonePolylinesAtRenderTime(
           polylines.push({
             coordinates: currentGroup.points,
             crimeCount: currentGroup.maxCrime,
-            zoneId: currentGroup.zoneId
+            zoneId: currentGroup.zoneId,
+            color: currentGroup.color,
+            outlineColor: currentGroup.outlineColor,
+            opacity: currentGroup.opacity,
+            dangerLevel: currentGroup.dangerLevel
           });
         }
         currentGroup = null;
@@ -1836,7 +1917,11 @@ export function computeInZonePolylinesAtRenderTime(
     polylines.push({
       coordinates: currentGroup.points,
       crimeCount: currentGroup.maxCrime,
-      zoneId: currentGroup.zoneId
+      zoneId: currentGroup.zoneId,
+      color: currentGroup.color,
+      outlineColor: currentGroup.outlineColor,
+      opacity: currentGroup.opacity,
+      dangerLevel: currentGroup.dangerLevel
     });
   }
 

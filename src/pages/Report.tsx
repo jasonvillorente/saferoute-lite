@@ -301,7 +301,7 @@ export default function Report() {
         </div>
         <h2 className={`text-2xl font-bold mb-2 ${darkMode ? 'text-white' : 'text-slate-900'}`}>Report Submitted!</h2>
         <p className={`max-w-sm text-sm ${darkMode ? 'text-slate-400' : 'text-slate-500'}`}>
-          Barangay officials will verify your report shortly. Thank you for keeping our community safe.
+          Your report will be reviewed by the Barangay. Officials decide whether it becomes a caution area and its level.
         </p>
       </div>
     );
