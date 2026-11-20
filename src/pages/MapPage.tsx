@@ -361,25 +361,29 @@ function MapViewController({
 }) {
   const map = useMap();
   const hasCenteredInitially = useRef(false);
+  const onMapInstanceRef = useRef(onMapInstance);
+  onMapInstanceRef.current = onMapInstance;
+  const onBoundsChangeRef = useRef(onBoundsChange);
+  onBoundsChangeRef.current = onBoundsChange;
 
   useEffect(() => {
     if (map) {
-      onMapInstance(map);
-      if (onBoundsChange) {
-        onBoundsChange(map.getBounds());
+      onMapInstanceRef.current(map);
+      if (onBoundsChangeRef.current) {
+        onBoundsChangeRef.current(map.getBounds());
       }
     }
-  }, [map, onMapInstance, onBoundsChange]);
+  }, [map]);
 
   useMapEvents({
     dragstart() {
       onUserDrag();
     },
     moveend() {
-      if (map && onBoundsChange) onBoundsChange(map.getBounds());
+      if (map && onBoundsChangeRef.current) onBoundsChangeRef.current(map.getBounds());
     },
     zoomend() {
-      if (map && onBoundsChange) onBoundsChange(map.getBounds());
+      if (map && onBoundsChangeRef.current) onBoundsChangeRef.current(map.getBounds());
     }
   });
 
@@ -582,6 +586,7 @@ export default function MapPage() {
   // Simulated navigation movement
   const [isSimulating, setIsSimulating] = useState(false);
   const [simulatedIndex, setSimulatedIndex] = useState(0);
+  const simulatedIndexRef = useRef(0);
   const [currentLoc, setCurrentLoc] = useState<[number, number] | null>(null);
   const [proximityAlert, setProximityAlert] = useState<string | null>(null);
   const simulationTimer = useRef<NodeJS.Timeout | null>(null);
@@ -589,12 +594,16 @@ export default function MapPage() {
   // Simulated clock override (Strictly applied ONLY while isSimulating is TRUE)
   // Selector options: 'now' (null) | '10pm' (22) | '2pm' (14) | 'custom' (customSimHour)
   const [simClockMode, setSimClockMode] = useState<'now' | '10pm' | '2pm' | 'custom'>('now');
+  const simClockModeRef = useRef(simClockMode);
+  simClockModeRef.current = simClockMode;
   const [customSimHour, setCustomSimHour] = useState<number>(20);
   const simulatedHour: number | null = isSimulating
     ? (simClockMode === '10pm' ? 22 : simClockMode === '2pm' ? 14 : simClockMode === 'custom' ? customSimHour : null)
     : null;
   const currentSimHourRef = useRef<number | null>(null);
   currentSimHourRef.current = simulatedHour;
+  const routesRef = useRef<CalculatedRoute[]>(routes);
+  routesRef.current = routes;
   
   // Dynamic route analytics and safety segmentation helper (delegates to computeRouteZoneMetrics)
   const processRouteCoordinates = (
@@ -1865,26 +1874,24 @@ export default function MapPage() {
         }
       }
     } else {
-      setRoutes(prevRoutes => {
-        if (!prevRoutes || prevRoutes.length === 0) return prevRoutes;
-        if (!startPoint || !endPoint) return prevRoutes;
-        const rawFromPrev: RawRouteCandidate[] = prevRoutes.map(r => ({
-          coordinates: r.coordinates,
-          distance: r.distance,
-          duration: r.duration,
-          steps: r.steps
-        }));
-        const result = processRoutePipeline({
-          candidates: rawFromPrev,
-          start: startPoint,
-          end: endPoint,
-          zones,
-          isSim,
-          simHour
-        });
-        setRouteWarning(result.statusMessage || result.warning || null);
-        return result.routes;
+      const prevRoutes = routesRef.current;
+      if (!prevRoutes || prevRoutes.length === 0 || !startPoint || !endPoint) return;
+      const rawFromPrev: RawRouteCandidate[] = prevRoutes.map(r => ({
+        coordinates: r.coordinates,
+        distance: r.distance,
+        duration: r.duration,
+        steps: r.steps
+      }));
+      const result = processRoutePipeline({
+        candidates: rawFromPrev,
+        start: startPoint,
+        end: endPoint,
+        zones,
+        isSim,
+        simHour
       });
+      setRoutes(result.routes);
+      setRouteWarning(result.statusMessage || result.warning || null);
     }
   };
 
@@ -1940,6 +1947,7 @@ export default function MapPage() {
     setSimulatedOverride(coords[0]);
     setActiveRouteIndex(resolvedIndex);
     setIsSimulating(true);
+    simulatedIndexRef.current = 0;
     setSimulatedIndex(0);
     setCurrentLoc(coords[0]);
     setProximityAlert(null);
@@ -1950,48 +1958,49 @@ export default function MapPage() {
     if (simulationTimer.current) clearInterval(simulationTimer.current);
 
     simulationTimer.current = setInterval(() => {
-      setSimulatedIndex(prev => {
-        const nextIdx = prev + 3; // Step faster to bypass long wait
-        if (nextIdx >= coords.length) {
-          clearInterval(simulationTimer.current!);
-          simulationTimer.current = null;
-          setSimulatedOverride(null);
-          setIsSimulating(false);
-          playAlertBuzzer();
-          setCurrentLoc(coords[coords.length - 1]);
-          if (simClockMode !== 'now') {
-            resetSimulationClock();
-            recomputeRoutesWithClock(false, null);
-          }
-          return coords.length - 1;
+      const nextIdx = simulatedIndexRef.current + 3; // Step faster to bypass long wait
+      if (nextIdx >= coords.length) {
+        clearInterval(simulationTimer.current!);
+        simulationTimer.current = null;
+        const endIdx = coords.length - 1;
+        simulatedIndexRef.current = endIdx;
+        setSimulatedIndex(endIdx);
+        setSimulatedOverride(null);
+        setIsSimulating(false);
+        playAlertBuzzer();
+        setCurrentLoc(coords[endIdx]);
+        if (simClockModeRef.current !== 'now') {
+          resetSimulationClock();
+          recomputeRoutesWithClock(false, null);
         }
+        return;
+      }
 
-        const point = coords[nextIdx];
-        setSimulatedOverride(point);
-        setCurrentLoc(point);
+      simulatedIndexRef.current = nextIdx;
+      setSimulatedIndex(nextIdx);
+      const point = coords[nextIdx];
+      setSimulatedOverride(point);
+      setCurrentLoc(point);
 
-        // Scan radar alert proximity limits using active simulated clock override
-        let activeDangerMsg: string | null = null;
-        zones.forEach(zone => {
-          if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
-          if (!isZoneCurrentlyActive(zone, true, currentSimHourRef.current)) return; // Strictly feeds simulated clock!
-          const d = getDistanceMeters(point[0], point[1], zone.location.lat, zone.location.lng);
-          if (d <= zone.radius) {
-            activeDangerMsg = `PROXIMITY WARNING: Inside active ${ZONE_LABEL.toLowerCase()}: "${zone.description}".`;
-          } else if (d <= zone.radius * 1.5 && !activeDangerMsg) {
-            activeDangerMsg = `AWARENESS: Nearing active ${ZONE_LABEL.toLowerCase()}: "${zone.description}" within ${Math.round(d)}m.`;
-          }
-        });
-
-        if (activeDangerMsg) {
-          setProximityAlert(activeDangerMsg);
-          playAlertBuzzer();
-        } else {
-          setProximityAlert(null);
+      // Scan radar alert proximity limits using active simulated clock override
+      let activeDangerMsg: string | null = null;
+      zones.forEach(zone => {
+        if (!zone || isZoneResolved(zone) || zone.active === false || !zone.location || typeof zone.location.lat !== 'number' || typeof zone.location.lng !== 'number') return;
+        if (!isZoneCurrentlyActive(zone, true, currentSimHourRef.current)) return; // Strictly feeds simulated clock!
+        const d = getDistanceMeters(point[0], point[1], zone.location.lat, zone.location.lng);
+        if (d <= zone.radius) {
+          activeDangerMsg = `PROXIMITY WARNING: Inside active ${ZONE_LABEL.toLowerCase()}: "${zone.description}".`;
+        } else if (d <= zone.radius * 1.5 && !activeDangerMsg) {
+          activeDangerMsg = `AWARENESS: Nearing active ${ZONE_LABEL.toLowerCase()}: "${zone.description}" within ${Math.round(d)}m.`;
         }
-
-        return nextIdx;
       });
+
+      if (activeDangerMsg) {
+        setProximityAlert(activeDangerMsg);
+        playAlertBuzzer();
+      } else {
+        setProximityAlert(null);
+      }
     }, 800);
   };
 
@@ -2326,7 +2335,9 @@ export default function MapPage() {
             autoFollow={autoFollowGps} 
             onMapInstance={(m) => { mapRef.current = m; }} 
             onUserDrag={() => setAutoFollowGps(false)} 
-            onBoundsChange={setMapBounds}
+            onBoundsChange={(next) => {
+              setMapBounds(prev => (prev && prev.equals(next) ? prev : next));
+            }}
           />
           <InvalidateMapSize trigger={`${isSheetExpanded}-${routeCalculated}-${isSimulating}`} />
 
